@@ -50,6 +50,9 @@ class SimulationState:
     enable_twitter: bool = True
     enable_reddit: bool = True
 
+    # Simulation type: "social" (twitter/reddit) or "email_inbox" (B2B variant testing)
+    simulation_type: str = "social"
+
     # Status
     status: SimulationStatus = SimulationStatus.CREATED
 
@@ -82,6 +85,7 @@ class SimulationState:
             "graph_id": self.graph_id,
             "enable_twitter": self.enable_twitter,
             "enable_reddit": self.enable_reddit,
+            "simulation_type": self.simulation_type,
             "status": self.status.value,
             "entities_count": self.entities_count,
             "profiles_count": self.profiles_count,
@@ -173,6 +177,7 @@ class SimulationManager:
             graph_id=data.get("graph_id", ""),
             enable_twitter=data.get("enable_twitter", True),
             enable_reddit=data.get("enable_reddit", True),
+            simulation_type=data.get("simulation_type", "social"),
             status=SimulationStatus(data.get("status", "created")),
             entities_count=data.get("entities_count", 0),
             profiles_count=data.get("profiles_count", 0),
@@ -196,15 +201,23 @@ class SimulationManager:
         graph_id: str,
         enable_twitter: bool = True,
         enable_reddit: bool = True,
+        simulation_type: str = "social",
+        email_variants: list = None,
     ) -> SimulationState:
         """
-        Create a new simulation
+        Create a new simulation.
+
+        For email_inbox simulations, pass email_variants (list of variant dicts with
+        subject_line/body/hook_type) — they are saved to email_variants.json in the
+        sim dir so the runner script can seed the EmailInboxPlatform at start time.
 
         Args:
             project_id: Project ID
             graph_id: Graph ID
             enable_twitter: Whether to enable Twitter simulation
             enable_reddit: Whether to enable Reddit simulation
+            simulation_type: "social" | "email_inbox"
+            email_variants: Email copy variants (email_inbox only)
 
         Returns:
             SimulationState
@@ -218,12 +231,24 @@ class SimulationManager:
             graph_id=graph_id,
             enable_twitter=enable_twitter,
             enable_reddit=enable_reddit,
+            simulation_type=simulation_type,
             status=SimulationStatus.CREATED,
         )
-        
+
         self._save_simulation_state(state)
-        logger.info(f"Created simulation: {simulation_id}, project={project_id}, graph={graph_id}")
-        
+
+        # For email inbox: persist the variant copy so the runner can seed the platform DB.
+        if simulation_type == "email_inbox" and email_variants:
+            sim_dir = self._get_simulation_dir(simulation_id)
+            variants_path = os.path.join(sim_dir, "email_variants.json")
+            with open(variants_path, "w", encoding="utf-8") as f:
+                json.dump(email_variants, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(email_variants)} email variants to {variants_path}")
+
+        logger.info(
+            f"Created simulation: {simulation_id}, project={project_id}, "
+            f"graph={graph_id}, type={simulation_type}"
+        )
         return state
     
     def prepare_simulation(
@@ -314,11 +339,12 @@ class SimulationManager:
                     total=total_entities
                 )
 
-            # Pass graph_id to enable graph retrieval for richer context
+            # Pass graph_id + simulation_type so email_inbox generates B2B personas
             generator = OasisProfileGenerator(
                 storage=storage,
                 graph_id=state.graph_id,
                 simulation_requirement=simulation_requirement,
+                simulation_type=state.simulation_type,
             )
             
             def profile_progress(current, total, msg):
@@ -332,10 +358,14 @@ class SimulationManager:
                         item_name=msg
                     )
             
-            # Set real-time save file path (prefer Reddit JSON format)
+            # Set real-time save file path based on simulation type / enabled platforms
             realtime_output_path = None
             realtime_platform = "reddit"
-            if state.enable_reddit:
+            if state.simulation_type == "email_inbox":
+                # Email inbox saves profiles as JSON with B2B fields included
+                realtime_output_path = os.path.join(sim_dir, "email_inbox_profiles.json")
+                realtime_platform = "email_inbox"
+            elif state.enable_reddit:
                 realtime_output_path = os.path.join(sim_dir, "reddit_profiles.json")
                 realtime_platform = "reddit"
             elif state.enable_twitter:
@@ -364,20 +394,27 @@ class SimulationManager:
                     total=total_entities
                 )
             
-            if state.enable_reddit:
+            if state.simulation_type == "email_inbox":
+                # Email inbox profiles — JSON format including all B2B decision-maker fields
                 generator.save_profiles(
                     profiles=profiles,
-                    file_path=os.path.join(sim_dir, "reddit_profiles.json"),
-                    platform="reddit"
+                    file_path=os.path.join(sim_dir, "email_inbox_profiles.json"),
+                    platform="email_inbox"
                 )
-            
-            if state.enable_twitter:
-                # Twitter uses CSV format! This is an OASIS requirement
-                generator.save_profiles(
-                    profiles=profiles,
-                    file_path=os.path.join(sim_dir, "twitter_profiles.csv"),
-                    platform="twitter"
-                )
+            else:
+                if state.enable_reddit:
+                    generator.save_profiles(
+                        profiles=profiles,
+                        file_path=os.path.join(sim_dir, "reddit_profiles.json"),
+                        platform="reddit"
+                    )
+                if state.enable_twitter:
+                    # Twitter uses CSV format — OASIS requirement
+                    generator.save_profiles(
+                        profiles=profiles,
+                        file_path=os.path.join(sim_dir, "twitter_profiles.csv"),
+                        platform="twitter"
+                    )
 
             if progress_callback:
                 progress_callback(

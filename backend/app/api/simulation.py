@@ -847,6 +847,36 @@ def list_simulations():
         }), 500
 
 
+@simulation_bp.route('/projects', methods=['GET'])
+def list_projects():
+    """List all projects that have a built ICP graph.
+
+    Used by the VariantTestView frontend to populate the project selector.
+    Returns projects sorted by creation date (newest first).
+
+    Response:
+        {"success": true, "projects": [{"project_id", "name", "status", "graph_id"}, ...]}
+    """
+    try:
+        projects = ProjectManager.list_projects()
+        # Only include projects with a built graph (graph_id set)
+        result = [
+            {
+                "project_id": p.project_id,
+                "name": p.name or p.project_id,
+                "status": p.status,
+                "graph_id": p.graph_id,
+                "simulation_type": getattr(p, "simulation_type", "social"),
+            }
+            for p in projects
+            if p.graph_id
+        ]
+        return jsonify({"success": True, "projects": result})
+    except Exception as e:
+        logger.error(f"Failed to list projects: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 def _get_report_id_for_simulation(simulation_id: str) -> str:
     """
     Get the latest report_id corresponding to a simulation
@@ -3256,57 +3286,102 @@ def run_variant_test():
 
         variant_run_ids = []
 
-        def _start_one_variant(variant: dict) -> dict:
-            """Create and start a simulation for a single variant."""
+        import threading
+        from ..models.task import TaskManager, TaskStatus
+
+        # Capture Flask app context resources before spawning threads
+        app = current_app._get_current_object()
+        storage = app.extensions.get("neo4j_storage")
+        document_text = ProjectManager.get_extracted_text(project_id) or ""
+
+        # Default requirement if the user left it blank
+        if not simulation_requirement:
+            simulation_requirement = (
+                "Test B2B cold email copy variants against HR Director / Head of People "
+                "decision-maker personas at Spanish SMEs."
+            )
+            project.simulation_requirement = simulation_requirement
+
+        def _create_and_prepare_variant(variant: dict) -> dict:
+            """Create a simulation, store the variant copy, and trigger prepare."""
             vid = variant.get("id", 0)
             label = variant.get("label", f"Variant {vid}")
 
-            # Build simulation-specific requirement string injecting the variant copy
-            variant_requirement = (
-                f"{simulation_requirement}\n\n"
-                f"--- EMAIL VARIANT UNDER TEST ---\n"
-                f"Variant: {label}\n"
-                f"Hook type: {variant.get('hook_type', 'unknown')}\n"
-                f"Subject: {variant.get('subject_line', '')}\n"
-                f"Body: {variant.get('body', '')}\n"
-                f"--- END VARIANT ---"
-            )
-
-            # Create simulation via SimulationManager (instance method, not classmethod)
-            # Disable social platforms — email inbox uses its own Wonderwall module
-            manager = SimulationManager()
-            state = manager.create_simulation(
+            # Create simulation with email_inbox type and this variant's copy stored
+            sim_manager = SimulationManager()
+            state = sim_manager.create_simulation(
                 project_id=project_id,
                 graph_id=project.graph_id,
                 enable_twitter=False,
                 enable_reddit=False,
+                simulation_type="email_inbox",
+                email_variants=[variant],   # Single variant per simulation
             )
+            sim_id = state.simulation_id
+
+            # Create a TaskManager task for prepare progress tracking
+            task_manager = TaskManager()
+            task_id = task_manager.create_task(
+                task_type="simulation_prepare",
+                metadata={"simulation_id": sim_id, "project_id": project_id}
+            )
+
+            state.status = SimulationStatus.PREPARING
+            sim_manager._save_simulation_state(state)
+
+            def _do_prepare():
+                """Background thread: prepare this simulation's agent profiles + config."""
+                try:
+                    task_manager.update_task(
+                        task_id,
+                        status=TaskStatus.PROCESSING,
+                        progress=0,
+                        message="Starting agent profile generation..."
+                    )
+                    sim_manager.prepare_simulation(
+                        simulation_id=sim_id,
+                        simulation_requirement=simulation_requirement,
+                        document_text=document_text,
+                        storage=storage,
+                        parallel_profile_count=5,
+                    )
+                    task_manager.complete_task(task_id, result={"simulation_id": sim_id})
+                    logger.info(f"Prepare complete for variant sim {sim_id}")
+                except Exception as e:
+                    logger.error(f"Prepare failed for variant sim {sim_id}: {e}")
+                    task_manager.fail_task(task_id, str(e))
+                    fail_state = sim_manager.get_simulation(sim_id)
+                    if fail_state:
+                        fail_state.status = SimulationStatus.FAILED
+                        fail_state.error = str(e)
+                        sim_manager._save_simulation_state(fail_state)
+
+            thread = threading.Thread(target=_do_prepare, daemon=True)
+            thread.start()
 
             return {
                 "variant_id": vid,
                 "variant_label": label,
-                "simulation_id": state.simulation_id,
-                "status": "created",
+                "simulation_id": sim_id,
+                "prepare_task_id": task_id,
+                "status": "preparing",
+                "num_rounds": num_rounds,
             }
 
         if parallel:
-            # Launch all variants concurrently using threads
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(variants)) as executor:
-                futures = {executor.submit(_start_one_variant, v): v for v in variants}
+                futures = {executor.submit(_create_and_prepare_variant, v): v for v in variants}
                 for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    variant_run_ids.append(result)
+                    variant_run_ids.append(future.result())
         else:
-            # Sequential: create all simulations (start triggers are separate)
             for variant in variants:
-                result = _start_one_variant(variant)
-                variant_run_ids.append(result)
+                variant_run_ids.append(_create_and_prepare_variant(variant))
 
         # Sort by variant_id for consistent ordering
         variant_run_ids.sort(key=lambda x: x["variant_id"])
 
-        # Persist variant→simulation mapping so report agent can query all DBs
+        # Persist variant→simulation mapping so the report agent can query all DBs
         project.variant_simulation_ids = variant_run_ids
         ProjectManager.save_project(project)
 
