@@ -53,6 +53,9 @@ class Project:
     # Each item: {id, label, subject_line, body, hook_type}
     variants: List[Dict[str, Any]] = field(default_factory=list)
     simulation_type: str = "social"  # "social" | "email_inbox"
+    # Maps each variant to its simulation_id — populated by run-variant-test
+    # Each item: {variant_id, variant_label, simulation_id, status}
+    variant_simulation_ids: List[Dict[str, Any]] = field(default_factory=list)
 
     # Error information
     error: Optional[str] = None
@@ -77,6 +80,7 @@ class Project:
             "error": self.error,
             "variants": self.variants,
             "simulation_type": self.simulation_type,
+            "variant_simulation_ids": self.variant_simulation_ids,
         }
 
     @classmethod
@@ -104,6 +108,7 @@ class Project:
             error=data.get('error'),
             variants=data.get('variants', []),
             simulation_type=data.get('simulation_type', 'social'),
+            variant_simulation_ids=data.get('variant_simulation_ids', []),
         )
 
 

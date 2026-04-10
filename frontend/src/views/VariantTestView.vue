@@ -179,6 +179,88 @@
         </table>
       </div>
 
+      <!-- Report generation -->
+      <div class="report-section">
+        <div class="report-section-header">
+          <h3 class="section-title">Analysis Report</h3>
+          <button
+            v-if="!report && !reportLoading"
+            class="generate-report-btn"
+            @click="generateReport"
+          >
+            Generate Report
+          </button>
+        </div>
+
+        <!-- Report loading -->
+        <div v-if="reportLoading" class="report-loading">
+          <div class="loading-ring small"></div>
+          <span class="report-loading-text">{{ reportStatus }}…</span>
+          <div class="report-progress-bar">
+            <div class="report-progress-fill" :style="{ width: reportProgress + '%' }"></div>
+          </div>
+        </div>
+
+        <!-- Report error -->
+        <div v-if="reportError" class="vt-error">{{ reportError }}</div>
+
+        <!-- Report display -->
+        <div v-if="report" class="report-content">
+
+          <!-- Winner callout -->
+          <div v-if="report.outline" class="winner-callout">
+            <div class="winner-callout-label">★ WINNER</div>
+            <div class="winner-callout-summary">{{ report.outline.summary }}</div>
+          </div>
+
+          <!-- Variant performance table (parsed from variant_analysis) -->
+          <div v-if="parsedVariants.length > 0" class="ranked-variants">
+            <h4 class="subsection-title">Variant Performance</h4>
+            <table class="ranking-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Variant</th>
+                  <th>Hook</th>
+                  <th>Open%</th>
+                  <th>Reply%</th>
+                  <th>Intent</th>
+                  <th>Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(v, idx) in parsedVariants"
+                  :key="v.label"
+                  :class="{ 'row-winner': idx === 0 }"
+                >
+                  <td class="rank-num">{{ idx + 1 }}</td>
+                  <td class="variant-name">
+                    <span v-if="idx === 0" class="winner-badge">★</span>
+                    {{ v.label }}
+                  </td>
+                  <td>{{ v.hook }}</td>
+                  <td>{{ v.openPct }}</td>
+                  <td>{{ v.replyPct }}</td>
+                  <td>{{ v.intent }}</td>
+                  <td class="score-cell">{{ v.score }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Report sections -->
+          <div
+            v-for="section in report.outline.sections"
+            :key="section.title"
+            class="report-body-section"
+          >
+            <h4 class="subsection-title">{{ section.title }}</h4>
+            <div class="section-body">{{ section.content }}</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Restart button -->
       <div class="results-actions">
         <button class="restart-btn" @click="resetForm">Run Another Test</button>
@@ -188,7 +270,7 @@
 </template>
 
 <script>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { getSimulationList } from '../api/simulation.js'
 
@@ -202,6 +284,14 @@ export default {
     const loadingStatus = ref('')
     const error = ref('')
     const results = ref(null)
+
+    // Report generation state
+    const report = ref(null)
+    const reportLoading = ref(false)
+    const reportError = ref('')
+    const reportStatus = ref('')
+    const reportProgress = ref(0)
+    let reportPollTimer = null
 
     // Default form: 2 variants, problem vs timeline hook
     const form = ref({
@@ -346,7 +436,120 @@ export default {
     function resetForm() {
       results.value = null
       error.value = ''
+      report.value = null
+      reportError.value = ''
+      reportLoading.value = false
+      if (reportPollTimer) { clearInterval(reportPollTimer); reportPollTimer = null }
     }
+
+    // Parse variant rows from variant_analysis text for table display
+    const parsedVariants = computed(() => {
+      if (!report.value || !report.value.variant_analysis) return []
+      const lines = report.value.variant_analysis.split('\n')
+      const rows = []
+      // Find the ranked table lines (lines after the header/separator)
+      let inTable = false
+      for (const line of lines) {
+        if (line.includes('VARIANT RANKINGS')) { inTable = true; continue }
+        if (line.includes('DROPOUT') || line.includes('HOOK-TYPE')) { inTable = false }
+        if (!inTable) continue
+        // Skip header/separator lines
+        if (line.startsWith('-') || line.startsWith('Rank') || line.trim() === '') continue
+        // Parse data rows: rank, label, hook, open%, read%, reply%, fwd%, intent, score
+        const parts = line.trim().split(/\s{2,}/)
+        if (parts.length >= 7) {
+          rows.push({
+            label: parts[1]?.trim() || '',
+            hook: parts[2]?.trim() || '',
+            openPct: parts[3]?.trim() || '',
+            replyPct: parts[5]?.trim() || '',
+            intent: parts[7]?.trim() || '',
+            score: parts[8]?.trim() || '',
+          })
+        }
+      }
+      return rows
+    })
+
+    async function generateReport() {
+      if (!results.value || !results.value.variant_run_ids?.length) return
+      reportLoading.value = true
+      reportError.value = ''
+      reportStatus.value = 'Requesting report generation'
+      reportProgress.value = 5
+
+      // Use the first simulation_id from the variant run — the backend aggregates all
+      const simId = results.value.variant_run_ids[0].simulation_id
+      try {
+        const resp = await fetch('/api/report/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ simulation_id: simId }),
+        })
+        const data = await resp.json()
+        if (!data.success) throw new Error(data.error || 'Report generation failed')
+
+        const { report_id, task_id, already_generated } = data.data
+
+        if (already_generated) {
+          // Report already exists — fetch directly
+          await fetchReport(report_id)
+          return
+        }
+
+        // Poll for completion
+        pollReport(task_id, report_id)
+      } catch (e) {
+        reportError.value = e.message || 'Unexpected error'
+        reportLoading.value = false
+      }
+    }
+
+    function pollReport(taskId, reportId) {
+      reportPollTimer = setInterval(async () => {
+        try {
+          const resp = await fetch('/api/report/generate/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_id: taskId }),
+          })
+          const data = await resp.json()
+          if (!data.success) return
+
+          const { status, progress, message } = data.data
+          reportStatus.value = message || status
+          reportProgress.value = progress || 0
+
+          if (status === 'completed') {
+            clearInterval(reportPollTimer)
+            await fetchReport(reportId)
+          } else if (status === 'failed') {
+            clearInterval(reportPollTimer)
+            reportError.value = message || 'Report generation failed'
+            reportLoading.value = false
+          }
+        } catch (e) {
+          // Non-fatal — keep polling
+        }
+      }, 3000)
+    }
+
+    async function fetchReport(reportId) {
+      try {
+        const resp = await fetch(`/api/report/${reportId}`)
+        const data = await resp.json()
+        if (!data.success) throw new Error(data.error || 'Failed to fetch report')
+        report.value = data.data
+      } catch (e) {
+        reportError.value = e.message || 'Failed to load report'
+      } finally {
+        reportLoading.value = false
+      }
+    }
+
+    onUnmounted(() => {
+      if (reportPollTimer) clearInterval(reportPollTimer)
+    })
 
     onMounted(() => {
       loadProjects()
@@ -370,6 +573,14 @@ export default {
       viewSimulation,
       downloadResults,
       resetForm,
+      // Report
+      report,
+      reportLoading,
+      reportError,
+      reportStatus,
+      reportProgress,
+      parsedVariants,
+      generateReport,
     }
   },
 }
@@ -790,5 +1001,132 @@ export default {
   border-radius: 6px;
   cursor: pointer;
   font-size: 13px;
+}
+
+/* Report section */
+.report-section {
+  background: #0d0d14;
+  border: 1px solid #1e1e2e;
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+.report-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.generate-report-btn {
+  background: #a78bfa;
+  color: #0a0a0f;
+  border: none;
+  padding: 8px 18px;
+  border-radius: 5px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.03em;
+}
+
+.generate-report-btn:hover {
+  background: #c4b5fd;
+}
+
+.report-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  flex-wrap: wrap;
+}
+
+.loading-ring.small {
+  width: 20px;
+  height: 20px;
+  border-width: 2px;
+  flex-shrink: 0;
+}
+
+.report-loading-text {
+  font-size: 13px;
+  color: #6b6b82;
+}
+
+.report-progress-bar {
+  width: 100%;
+  height: 3px;
+  background: #1e1e2e;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.report-progress-fill {
+  height: 100%;
+  background: #a78bfa;
+  transition: width 0.4s ease;
+}
+
+.winner-callout {
+  background: #12121f;
+  border: 1px solid #3b2a6b;
+  border-left: 3px solid #a78bfa;
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin-bottom: 20px;
+}
+
+.winner-callout-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #a78bfa;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.winner-callout-summary {
+  font-size: 14px;
+  color: #c4b5fd;
+  line-height: 1.5;
+}
+
+.ranked-variants {
+  margin-bottom: 20px;
+}
+
+.subsection-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #4b4b60;
+  margin-bottom: 12px;
+}
+
+.score-cell {
+  color: #a78bfa;
+  font-weight: 600;
+}
+
+.report-content {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.report-body-section {
+  border-top: 1px solid #111118;
+  padding-top: 16px;
+}
+
+.section-body {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #a0a0b4;
+  white-space: pre-wrap;
 }
 </style>

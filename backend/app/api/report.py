@@ -138,11 +138,12 @@ def generate_report():
                     message="Initializing Report Agent..."
                 )
 
-                # Create Report Agent
+                # Create Report Agent — pass simulation_type so email_inbox gets correct prompts
                 agent = ReportAgent(
                     graph_id=graph_id,
                     simulation_id=simulation_id,
                     simulation_requirement=simulation_requirement,
+                    simulation_type=project.simulation_type,
                     graph_tools=graph_tools
                 )
 

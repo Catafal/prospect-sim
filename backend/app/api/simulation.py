@@ -3245,6 +3245,7 @@ def run_variant_test():
         project.simulation_type = "email_inbox"
         if simulation_requirement:
             project.simulation_requirement = simulation_requirement
+        # variant_simulation_ids populated below after simulations are created
         ProjectManager.save_project(project)
 
         run_mode = "parallel" if parallel else "sequential"
@@ -3304,6 +3305,10 @@ def run_variant_test():
 
         # Sort by variant_id for consistent ordering
         variant_run_ids.sort(key=lambda x: x["variant_id"])
+
+        # Persist variant→simulation mapping so report agent can query all DBs
+        project.variant_simulation_ids = variant_run_ids
+        ProjectManager.save_project(project)
 
         return jsonify({
             "success": True,
