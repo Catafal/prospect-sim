@@ -1727,10 +1727,10 @@ def start_simulation():
                     "error": "max_rounds must be a valid integer"
                 }), 400
 
-        if platform not in ['twitter', 'reddit', 'parallel']:
+        if platform not in ['twitter', 'reddit', 'parallel', 'email_inbox']:
             return jsonify({
                 "success": False,
-                "error": f"Invalid platform type: {platform}, options: twitter/reddit/parallel"
+                "error": f"Invalid platform type: {platform}, options: twitter/reddit/parallel/email_inbox"
             }), 400
 
         enable_cross_platform = data.get('enable_cross_platform', True)
