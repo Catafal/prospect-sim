@@ -396,6 +396,10 @@ class SimulationRunner:
         elif platform == "reddit":
             script_name = "run_reddit_simulation.py"
             state.reddit_running = True
+        elif platform == "email_inbox":
+            # B2B email variant simulation — runs EmailInboxPlatform against HR Director personas
+            script_name = "run_email_inbox_simulation.py"
+            state.email_inbox_running = True
         else:
             script_name = "run_parallel_simulation.py"
             state.twitter_running = True
@@ -502,6 +506,7 @@ class SimulationRunner:
         # New log structure: per-platform action logs
         twitter_actions_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
         reddit_actions_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
+        email_inbox_actions_log = os.path.join(sim_dir, "email_inbox", "actions.jsonl")
 
         process = cls._processes.get(simulation_id)
         state = cls.get_run_state(simulation_id)
@@ -513,10 +518,13 @@ class SimulationRunner:
         # old simulation_end events that would falsely mark the sim as completed
         twitter_position = 0
         reddit_position = 0
+        email_inbox_position = 0
         if os.path.exists(twitter_actions_log):
             twitter_position = os.path.getsize(twitter_actions_log)
         if os.path.exists(reddit_actions_log):
             reddit_position = os.path.getsize(reddit_actions_log)
+        if os.path.exists(email_inbox_actions_log):
+            email_inbox_position = os.path.getsize(email_inbox_actions_log)
 
         try:
             while process.poll() is None:  # Process still running
@@ -532,6 +540,12 @@ class SimulationRunner:
                         reddit_actions_log, reddit_position, state, "reddit"
                     )
 
+                # Read email inbox action logs (B2B variant testing)
+                if os.path.exists(email_inbox_actions_log):
+                    email_inbox_position = cls._read_action_log(
+                        email_inbox_actions_log, email_inbox_position, state, "email_inbox"
+                    )
+
                 # Update status
                 cls._save_run_state(state)
                 time.sleep(2)
@@ -541,7 +555,9 @@ class SimulationRunner:
                 cls._read_action_log(twitter_actions_log, twitter_position, state, "twitter")
             if os.path.exists(reddit_actions_log):
                 cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
-            
+            if os.path.exists(email_inbox_actions_log):
+                cls._read_action_log(email_inbox_actions_log, email_inbox_position, state, "email_inbox")
+
             # Process ended
             exit_code = process.returncode
             
@@ -650,7 +666,11 @@ class SimulationRunner:
                                         state.reddit_completed = True
                                         state.reddit_running = False
                                         logger.info(f"Reddit simulation completed: {state.simulation_id}, total_rounds={action_data.get('total_rounds')}, total_actions={action_data.get('total_actions')}")
-                                    
+                                    elif platform == "email_inbox":
+                                        # Email inbox variant simulation completed
+                                        state.email_inbox_running = False
+                                        logger.info(f"Email inbox simulation completed: {state.simulation_id}, total_rounds={action_data.get('total_rounds')}")
+
                                     # Check if all enabled platforms are completed
                                     # If only one platform was running, only check that one
                                     # If both platforms were running, both need to be completed
@@ -664,7 +684,7 @@ class SimulationRunner:
                                 elif event_type == "round_end":
                                     round_num = action_data.get("round", 0)
                                     simulated_hours = action_data.get("simulated_hours", 0)
-                                    
+
                                     # Update per-platform independent round and time
                                     if platform == "twitter":
                                         if round_num > state.twitter_current_round:
@@ -674,12 +694,17 @@ class SimulationRunner:
                                         if round_num > state.reddit_current_round:
                                             state.reddit_current_round = round_num
                                         state.reddit_simulated_hours = simulated_hours
+                                    # email_inbox: just update overall current_round below
 
                                     # Overall round is the maximum of all platforms
                                     if round_num > state.current_round:
                                         state.current_round = round_num
                                     # Overall time is the maximum of all platforms
-                                    state.simulated_hours = max(state.twitter_simulated_hours, state.reddit_simulated_hours)
+                                    state.simulated_hours = max(
+                                        state.twitter_simulated_hours,
+                                        state.reddit_simulated_hours,
+                                        simulated_hours if platform == "email_inbox" else 0,
+                                    )
                                 
                                 continue
                             
@@ -724,19 +749,24 @@ class SimulationRunner:
         sim_dir = os.path.join(cls.RUN_STATE_DIR, state.simulation_id)
         twitter_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
         reddit_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
+        email_inbox_log = os.path.join(sim_dir, "email_inbox", "actions.jsonl")
 
-        # Check which platforms are enabled (determined by file existence)
+        # Check which platforms are active (determined by log file existence)
         twitter_enabled = os.path.exists(twitter_log)
         reddit_enabled = os.path.exists(reddit_log)
+        email_inbox_enabled = os.path.exists(email_inbox_log)
 
-        # If platform is enabled but not completed, return False
+        # If a platform is active but not yet marked completed, return False
         if twitter_enabled and not state.twitter_completed:
             return False
         if reddit_enabled and not state.reddit_completed:
             return False
+        # email_inbox completion is signalled by the simulation_end event clearing email_inbox_running
+        if email_inbox_enabled and getattr(state, "email_inbox_running", False):
+            return False
 
-        # At least one platform is enabled and completed
-        return twitter_enabled or reddit_enabled
+        # At least one platform must be active
+        return twitter_enabled or reddit_enabled or email_inbox_enabled
     
     @classmethod
     def _terminate_process(cls, process: subprocess.Popen, simulation_id: str, timeout: int = 10):

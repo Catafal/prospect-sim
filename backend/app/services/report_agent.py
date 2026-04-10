@@ -13,6 +13,7 @@ import os
 import json
 import time
 import re
+import sqlite3
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -450,7 +451,9 @@ class Report:
     created_at: str = ""
     completed_at: str = ""
     error: Optional[str] = None
-    
+    # Raw output from variant_results tool — only populated for email_inbox simulations
+    variant_analysis: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "report_id": self.report_id,
@@ -462,7 +465,8 @@ class Report:
             "markdown_content": self.markdown_content,
             "created_at": self.created_at,
             "completed_at": self.completed_at,
-            "error": self.error
+            "error": self.error,
+            "variant_analysis": self.variant_analysis,
         }
 
 
@@ -632,6 +636,32 @@ and did on Twitter and Reddit. Use this BEFORE graph search tools.
 - Quote what specific agents said on Twitter/Reddit
 - Find the most viral/liked posts
 - Track how discourse evolved across rounds"""
+
+TOOL_DESC_VARIANT_RESULTS = """\
+[Variant Results — Email Inbox Simulation Data]
+Queries the email inbox SQLite database(s) and returns structured stats for all
+email copy variants tested in this simulation run.
+
+ONLY available for email_inbox simulations. Returns:
+1. Per-variant metrics: open_rate, read_rate, reply_rate, forward_rate, avg_intent_score
+2. Composite score ranking: reply_rate×3 + forward_rate×2 + open_rate×1
+3. Dropout breakdown: which copy element (subject_line, opening, body, cta, timing)
+   caused agents to abandon each variant
+4. Hook-type performance: which hook_type (problem/timeline/numbers/social_proof/curiosity)
+   had the best engagement across variants
+
+[Parameters]
+None required.
+
+[Return Content]
+- Ranked variants table with rates and composite scores
+- Per-variant dropout point counts
+- Hook-type aggregate summary
+
+[Use Cases]
+- Determine which variant won and by how much
+- Identify where agents dropped out (subject_line vs. body vs. cta)
+- Support data-driven winner recommendation"""
 
 # ── Outline Planning Prompt ──
 
@@ -1195,7 +1225,11 @@ class ReportAgent:
                     "round_num": "Optional round number filter"
                 }
             },
-        }
+            "variant_results": {
+                "name": "variant_results",
+                "description": TOOL_DESC_VARIANT_RESULTS,
+                "parameters": {}
+            },
         }
     
     def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], report_context: str = "") -> str:
@@ -1307,6 +1341,9 @@ class ReportAgent:
             elif tool_name == "simulation_feed":
                 return self._execute_simulation_feed(parameters)
 
+            elif tool_name == "variant_results":
+                return self._execute_variant_results()
+
             # ========== Backward compatible legacy tools (internally redirected to new tools) ==========
             
             elif tool_name == "search_graph":
@@ -1352,7 +1389,7 @@ class ReportAgent:
     VALID_TOOL_NAMES = {
         "insight_forge", "panorama_search", "quick_search", "interview_agents",
         "analyze_trajectory", "analyze_graph_structure", "find_causal_path", "detect_contradictions",
-        "simulation_feed",
+        "simulation_feed", "variant_results",
     }
 
     def _execute_trajectory_analysis(self, focus: str = "all") -> str:
@@ -1606,6 +1643,190 @@ class ReportAgent:
                     lines.append("No .jsonl files found anywhere in the simulation directory.")
                 else:
                     lines.append("The simulation directory does not exist.")
+
+        return "\n".join(lines)
+
+    def _get_variant_sim_dir(self, simulation_id: str) -> str:
+        """Resolve simulation directory for a given simulation_id (same logic as _get_simulation_dir)."""
+        candidates = [
+            os.path.join(Config.UPLOAD_FOLDER, 'simulations', simulation_id),
+            os.path.join(os.path.dirname(__file__), '..', '..', 'pipeline_test_output', simulation_id),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return candidates[0]
+
+    def _execute_variant_results(self) -> str:
+        """Query email_simulation.db for all variants and return structured stats.
+
+        Uses project.variant_simulation_ids to find each variant's simulation directory,
+        opens each email_simulation.db directly via sqlite3, and aggregates results.
+        Handles missing DBs gracefully — useful when simulation hasn't run yet.
+        """
+        # Import here to avoid circular imports at module level
+        from ..models.project import ProjectManager
+        from .simulation_manager import SimulationManager
+
+        lines = ["=== Email Variant Results ==="]
+
+        # Resolve project via this simulation's state
+        try:
+            mgr = SimulationManager()
+            state = mgr.get_simulation(self.simulation_id)
+            if not state:
+                return f"variant_results: simulation not found ({self.simulation_id})"
+            project = ProjectManager.get_project(state.project_id)
+            if not project:
+                return f"variant_results: project not found ({state.project_id})"
+        except Exception as e:
+            return f"variant_results: failed to load project — {e}"
+
+        # Build list of (variant_label, simulation_id) pairs to query
+        sim_pairs = [
+            (entry.get("variant_label", f"Variant {entry.get('variant_id', i+1)}"),
+             entry.get("simulation_id", ""))
+            for i, entry in enumerate(project.variant_simulation_ids)
+        ]
+
+        # Fallback: if variant_simulation_ids not populated, query current simulation only
+        if not sim_pairs:
+            label = project.variants[0].get("label", "Variant A") if project.variants else "Variant A"
+            sim_pairs = [(label, self.simulation_id)]
+            lines.append("[NOTE] variant_simulation_ids not set on project — querying current simulation only.")
+
+        # Query each simulation's email_simulation.db
+        all_stats: List[Dict] = []
+        all_dropouts: Dict[str, List[Dict]] = {}
+        missing_dbs: List[str] = []
+
+        for variant_label, sim_id in sim_pairs:
+            if not sim_id:
+                continue
+            sim_dir = self._get_variant_sim_dir(sim_id)
+            db_path = os.path.join(sim_dir, "email_simulation.db")
+
+            if not os.path.exists(db_path):
+                missing_dbs.append(f"{variant_label} ({sim_id})")
+                continue
+
+            try:
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+
+                # Per-variant engagement stats (same query as EmailInboxPlatform.get_variant_summary)
+                cur.execute(
+                    "SELECT v.variant_id, v.variant_label, v.hook_type, "
+                    "COUNT(DISTINCT s.agent_id) as total_agents, "
+                    "SUM(COALESCE(s.opened, 0)) as total_opens, "
+                    "SUM(COALESCE(s.read_to_completion, 0)) as total_reads, "
+                    "SUM(COALESCE(s.replied, 0)) as total_replies, "
+                    "SUM(COALESCE(s.forwarded, 0)) as total_forwards, "
+                    "AVG(COALESCE(s.reply_intent_score, 0)) as avg_intent "
+                    "FROM email_variant v "
+                    "LEFT JOIN agent_inbox_state s ON v.variant_id = s.variant_id "
+                    "GROUP BY v.variant_id "
+                    "ORDER BY total_replies DESC, avg_intent DESC"
+                )
+                for row in cur.fetchall():
+                    agents = row[3] or 1  # avoid division by zero
+                    opens, reads, replies, forwards = row[4] or 0, row[5] or 0, row[6] or 0, row[7] or 0
+                    avg_intent = round(float(row[8] or 0), 3)
+                    open_rate = round(opens / agents, 3)
+                    read_rate = round(reads / agents, 3)
+                    reply_rate = round(replies / agents, 3)
+                    forward_rate = round(forwards / agents, 3)
+                    composite = round(reply_rate * 3 + forward_rate * 2 + open_rate * 1, 3)
+                    all_stats.append({
+                        "variant_id": row[0],
+                        "variant_label": row[1],
+                        "hook_type": row[2],
+                        "total_agents": row[3] or 0,
+                        "open_rate": open_rate,
+                        "read_rate": read_rate,
+                        "reply_rate": reply_rate,
+                        "forward_rate": forward_rate,
+                        "avg_intent_score": avg_intent,
+                        "composite_score": composite,
+                    })
+
+                # Dropout breakdown (same query as EmailInboxPlatform.get_dropout_breakdown)
+                cur.execute(
+                    "SELECT v.variant_label, s.dropout_point, COUNT(*) as count "
+                    "FROM agent_inbox_state s "
+                    "JOIN email_variant v ON s.variant_id = v.variant_id "
+                    "WHERE s.dropout_point IS NOT NULL "
+                    "GROUP BY v.variant_id, s.dropout_point "
+                    "ORDER BY v.variant_id, count DESC"
+                )
+                for row in cur.fetchall():
+                    lbl = row[0]
+                    if lbl not in all_dropouts:
+                        all_dropouts[lbl] = []
+                    all_dropouts[lbl].append({"dropout_point": row[1], "count": row[2]})
+
+                conn.close()
+            except Exception as e:
+                lines.append(f"[WARN] Failed to query DB for {variant_label}: {e}")
+
+        if missing_dbs:
+            lines.append(f"[NOTE] No email DB found for: {', '.join(missing_dbs)} — simulation may not have run yet.")
+
+        if not all_stats:
+            return "\n".join(lines) + "\n[ERROR] No variant data found. Run the simulation first."
+
+        # Sort by composite score descending — this is the ranking
+        all_stats.sort(key=lambda x: x["composite_score"], reverse=True)
+
+        # Section 1: Ranked variants table
+        lines.append("\n--- VARIANT RANKINGS (reply_rate×3 + forward_rate×2 + open_rate×1) ---")
+        lines.append(f"{'Rank':<5} {'Variant':<20} {'Hook':<14} {'Open%':<8} {'Read%':<8} {'Reply%':<8} {'Fwd%':<7} {'Intent':<8} {'Score':<7}")
+        lines.append("-" * 85)
+        for i, v in enumerate(all_stats):
+            lines.append(
+                f"{i+1:<5} {v['variant_label']:<20} {v['hook_type']:<14} "
+                f"{v['open_rate']*100:>5.1f}%  {v['read_rate']*100:>5.1f}%  "
+                f"{v['reply_rate']*100:>5.1f}%  {v['forward_rate']*100:>4.1f}%  "
+                f"{v['avg_intent_score']:>5.3f}   {v['composite_score']:>5.3f}"
+            )
+
+        winner = all_stats[0]
+        lines.append(f"\n*** WINNER: {winner['variant_label']} (hook: {winner['hook_type']}, composite: {winner['composite_score']}) ***")
+        if len(all_stats) > 1:
+            runner = all_stats[1]
+            delta_reply = round((winner['reply_rate'] - runner['reply_rate']) * 100, 1)
+            lines.append(f"    Reply rate delta vs runner-up ({runner['variant_label']}): +{delta_reply}%")
+
+        # Section 2: Dropout breakdown per variant
+        lines.append("\n--- DROPOUT BREAKDOWN (where agents lost interest) ---")
+        if all_dropouts:
+            for label, points in all_dropouts.items():
+                lines.append(f"\n{label}:")
+                for dp in points:
+                    lines.append(f"  {dp['dropout_point']:20s}: {dp['count']} agents")
+        else:
+            lines.append("  No dropout data recorded (agents may not have archived any emails).")
+
+        # Section 3: Hook-type performance summary
+        lines.append("\n--- HOOK-TYPE PERFORMANCE ---")
+        hook_agg: Dict[str, Dict] = {}
+        for v in all_stats:
+            ht = v["hook_type"]
+            if ht not in hook_agg:
+                hook_agg[ht] = {"reply_rates": [], "open_rates": [], "count": 0}
+            hook_agg[ht]["reply_rates"].append(v["reply_rate"])
+            hook_agg[ht]["open_rates"].append(v["open_rate"])
+            hook_agg[ht]["count"] += 1
+
+        hook_summary = []
+        for ht, data in hook_agg.items():
+            avg_reply = sum(data["reply_rates"]) / len(data["reply_rates"])
+            avg_open = sum(data["open_rates"]) / len(data["open_rates"])
+            hook_summary.append((ht, avg_reply, avg_open, data["count"]))
+        hook_summary.sort(key=lambda x: x[1], reverse=True)
+
+        for ht, avg_reply, avg_open, count in hook_summary:
+            lines.append(f"  {ht:<18}: avg_reply={avg_reply*100:.1f}%  avg_open={avg_open*100:.1f}%  (n={count})")
 
         return "\n".join(lines)
 
@@ -2221,13 +2442,25 @@ Write in the same analytical style as the report. Use **bold** for emphasis. Do 
             )
             ReportManager.save_report(report)
             
+            # For email_inbox simulations: pre-fetch structured variant stats before planning.
+            # This populates report.variant_analysis so it's available in the API response
+            # and gives the LLM structured context when writing the report outline.
+            if self.simulation_type == "email_inbox":
+                try:
+                    variant_data = self._execute_variant_results()
+                    report.variant_analysis = variant_data
+                    ReportManager.save_report(report)
+                    logger.info("variant_analysis pre-fetched and saved for email_inbox report")
+                except Exception as e:
+                    logger.warning(f"Failed to pre-fetch variant_analysis: {e} — continuing without it")
+
             # Phase 1: Plan outline
             report.status = ReportStatus.PLANNING
             ReportManager.update_progress(
                 report_id, "planning", 5, "Starting report outline planning...",
                 completed_sections=[]
             )
-            
+
             # Record planning start log
             self.report_logger.log_planning_start()
             
@@ -3136,7 +3369,8 @@ class ReportManager:
             markdown_content=markdown_content,
             created_at=data.get('created_at', ''),
             completed_at=data.get('completed_at', ''),
-            error=data.get('error')
+            error=data.get('error'),
+            variant_analysis=data.get('variant_analysis'),
         )
     
     @classmethod

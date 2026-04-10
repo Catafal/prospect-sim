@@ -1333,6 +1333,7 @@ Do NOT include karma, friend_count, follower_count, or statuses_count.
         if platform == "twitter":
             self._save_twitter_csv(profiles, file_path)
         else:
+            # email_inbox uses the same JSON structure as reddit but includes B2B fields
             self._save_reddit_json(profiles, file_path)
     
     def _save_twitter_csv(self, profiles: List[OasisAgentProfile], file_path: str):

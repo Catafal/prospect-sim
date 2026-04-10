@@ -149,6 +149,7 @@
               <th>Hook Type</th>
               <th>Sim ID</th>
               <th>Status</th>
+              <th>Progress</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -156,11 +157,11 @@
             <tr
               v-for="(run, idx) in results.variant_run_ids"
               :key="run.variant_id"
-              :class="{ 'row-winner': idx === 0 }"
+              :class="{ 'row-winner': idx === 0 && allCompleted }"
             >
               <td class="rank-num">{{ idx + 1 }}</td>
               <td class="variant-name">
-                <span v-if="idx === 0" class="winner-badge">★</span>
+                <span v-if="idx === 0 && allCompleted" class="winner-badge">★</span>
                 {{ run.variant_label }}
               </td>
               <td>{{ getHookType(run.variant_id) }}</td>
@@ -168,6 +169,7 @@
               <td>
                 <span class="status-badge" :class="run.status">{{ run.status }}</span>
               </td>
+              <td class="progress-cell">{{ run.progress || '—' }}</td>
               <td>
                 <button
                   class="view-btn"
@@ -179,6 +181,90 @@
         </table>
       </div>
 
+      <!-- Report generation -->
+      <div class="report-section">
+        <div class="report-section-header">
+          <h3 class="section-title">Analysis Report</h3>
+          <button
+            v-if="!report && !reportLoading"
+            class="generate-report-btn"
+            :disabled="!allCompleted"
+            :title="allCompleted ? '' : 'Waiting for all simulations to complete…'"
+            @click="generateReport"
+          >
+            {{ allCompleted ? 'Generate Report' : 'Waiting for simulations…' }}
+          </button>
+        </div>
+
+        <!-- Report loading -->
+        <div v-if="reportLoading" class="report-loading">
+          <div class="loading-ring small"></div>
+          <span class="report-loading-text">{{ reportStatus }}…</span>
+          <div class="report-progress-bar">
+            <div class="report-progress-fill" :style="{ width: reportProgress + '%' }"></div>
+          </div>
+        </div>
+
+        <!-- Report error -->
+        <div v-if="reportError" class="vt-error">{{ reportError }}</div>
+
+        <!-- Report display -->
+        <div v-if="report" class="report-content">
+
+          <!-- Winner callout -->
+          <div v-if="report.outline" class="winner-callout">
+            <div class="winner-callout-label">★ WINNER</div>
+            <div class="winner-callout-summary">{{ report.outline.summary }}</div>
+          </div>
+
+          <!-- Variant performance table (parsed from variant_analysis) -->
+          <div v-if="parsedVariants.length > 0" class="ranked-variants">
+            <h4 class="subsection-title">Variant Performance</h4>
+            <table class="ranking-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Variant</th>
+                  <th>Hook</th>
+                  <th>Open%</th>
+                  <th>Reply%</th>
+                  <th>Intent</th>
+                  <th>Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(v, idx) in parsedVariants"
+                  :key="v.label"
+                  :class="{ 'row-winner': idx === 0 }"
+                >
+                  <td class="rank-num">{{ idx + 1 }}</td>
+                  <td class="variant-name">
+                    <span v-if="idx === 0" class="winner-badge">★</span>
+                    {{ v.label }}
+                  </td>
+                  <td>{{ v.hook }}</td>
+                  <td>{{ v.openPct }}</td>
+                  <td>{{ v.replyPct }}</td>
+                  <td>{{ v.intent }}</td>
+                  <td class="score-cell">{{ v.score }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Report sections -->
+          <div
+            v-for="section in report.outline.sections"
+            :key="section.title"
+            class="report-body-section"
+          >
+            <h4 class="subsection-title">{{ section.title }}</h4>
+            <div class="section-body">{{ section.content }}</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Restart button -->
       <div class="results-actions">
         <button class="restart-btn" @click="resetForm">Run Another Test</button>
@@ -188,7 +274,7 @@
 </template>
 
 <script>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { getSimulationList } from '../api/simulation.js'
 
@@ -202,6 +288,14 @@ export default {
     const loadingStatus = ref('')
     const error = ref('')
     const results = ref(null)
+
+    // Report generation state
+    const report = ref(null)
+    const reportLoading = ref(false)
+    const reportError = ref('')
+    const reportStatus = ref('')
+    const reportProgress = ref(0)
+    let reportPollTimer = null
 
     // Default form: 2 variants, problem vs timeline hook
     const form = ref({
@@ -268,22 +362,12 @@ export default {
 
     async function loadProjects() {
       try {
-        // Reuse simulation list endpoint to get projects with built graphs
-        const resp = await fetch('/api/simulation/list')
+        const resp = await fetch('/api/simulation/projects')
         const data = await resp.json()
-        if (data.success && data.simulations) {
-          // Extract unique projects from simulations (fallback)
-          const seen = new Set()
-          projects.value = data.simulations
-            .filter((s) => s.graph_id && !seen.has(s.project_id) && seen.add(s.project_id))
-            .map((s) => ({
-              project_id: s.project_id || s.simulation_id,
-              name: s.name || s.simulation_id,
-              status: s.status,
-            }))
+        if (data.success && data.projects) {
+          projects.value = data.projects
         }
       } catch (e) {
-        // Non-fatal — user can still type project ID manually
         console.warn('Could not load projects:', e)
       }
     }
@@ -294,9 +378,10 @@ export default {
       loading.value = true
       error.value = ''
       results.value = null
-      loadingStatus.value = 'Submitting variant test…'
+      loadingStatus.value = 'Creating simulations…'
 
       try {
+        // Step 1: Create simulations + trigger prepare for each variant
         const payload = {
           project_id: form.value.projectId,
           variants: form.value.variants,
@@ -310,19 +395,114 @@ export default {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         })
-
         const data = await resp.json()
+        if (!data.success) throw new Error(data.error || 'Variant test failed')
 
-        if (!data.success) {
-          throw new Error(data.error || 'Variant test failed')
-        }
-
+        // Store results so the UI can render the variant table while we wait
         results.value = data
-        loadingStatus.value = 'Done'
+        loadingStatus.value = 'Preparing agent profiles…'
+
+        // Step 2: Poll each simulation's prepare task until done, then start it
+        const variantRuns = data.variant_run_ids || []
+        await Promise.all(variantRuns.map((run) => orchestrateSim(run, data.num_rounds)))
+
+        // All simulations completed — mark done
+        results.value = { ...results.value }
+        loadingStatus.value = 'All simulations complete'
       } catch (e) {
         error.value = e.message || 'Unexpected error'
       } finally {
         loading.value = false
+      }
+    }
+
+    /**
+     * Orchestrate a single simulation: poll prepare → start → poll run.
+     * Updates `results.value.variant_run_ids[i].status` live so the table reflects progress.
+     */
+    async function orchestrateSim(run, numRounds) {
+      const { simulation_id, prepare_task_id } = run
+      if (!simulation_id) return
+
+      // Helper: update this run's status in the reactive results object
+      function setRunStatus(status) {
+        if (!results.value) return
+        const idx = results.value.variant_run_ids.findIndex(
+          (r) => r.simulation_id === simulation_id
+        )
+        if (idx !== -1) results.value.variant_run_ids[idx].status = status
+      }
+
+      // ---- Poll prepare ----
+      if (prepare_task_id) {
+        setRunStatus('preparing')
+        await pollUntilDone(
+          () => fetch('/api/simulation/prepare/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_id: prepare_task_id }),
+          }).then((r) => r.json()),
+          (d) => d?.data?.status === 'completed',
+          (d) => d?.data?.status === 'failed',
+          3000,
+        )
+      }
+
+      // ---- Start the simulation ----
+      setRunStatus('starting')
+      const startResp = await fetch('/api/simulation/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          simulation_id,
+          platform: 'email_inbox',
+          max_rounds: numRounds || 8,
+        }),
+      })
+      const startData = await startResp.json()
+      if (!startData.success) {
+        setRunStatus('failed')
+        console.error(`Failed to start ${simulation_id}:`, startData.error)
+        return
+      }
+
+      // ---- Poll run status ----
+      setRunStatus('running')
+      await pollUntilDone(
+        () => fetch(`/api/simulation/${simulation_id}/run-status`).then((r) => r.json()),
+        (d) => ['completed', 'stopped'].includes(d?.data?.runner_status),
+        (d) => d?.data?.runner_status === 'failed',
+        4000,
+        (d) => {
+          // Live progress update: show round X / total
+          const current = d?.data?.current_round ?? 0
+          const total = d?.data?.total_rounds ?? '?'
+          const idx = results.value?.variant_run_ids?.findIndex(
+            (r) => r.simulation_id === simulation_id
+          )
+          if (idx !== -1 && results.value) {
+            results.value.variant_run_ids[idx].progress = `round ${current}/${total}`
+          }
+        },
+      )
+      setRunStatus('completed')
+    }
+
+    /**
+     * Generic polling helper. Calls `fetchFn` every `intervalMs` until
+     * `isDone(result)` is true or `isFailed(result)` is true.
+     */
+    async function pollUntilDone(fetchFn, isDone, isFailed, intervalMs = 3000, onTick = null) {
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs))
+        try {
+          const result = await fetchFn()
+          if (onTick) onTick(result)
+          if (isDone(result)) return
+          if (isFailed(result)) return  // Don't throw — let the caller handle status
+        } catch (e) {
+          // Non-fatal poll failure — keep trying
+        }
       }
     }
 
@@ -346,7 +526,127 @@ export default {
     function resetForm() {
       results.value = null
       error.value = ''
+      report.value = null
+      reportError.value = ''
+      reportLoading.value = false
+      if (reportPollTimer) { clearInterval(reportPollTimer); reportPollTimer = null }
     }
+
+    // True when every variant simulation has finished — gates report generation
+    const allCompleted = computed(() => {
+      const runs = results.value?.variant_run_ids
+      if (!runs || runs.length === 0) return false
+      return runs.every((r) => r.status === 'completed')
+    })
+
+    // Parse variant rows from variant_analysis text for table display
+    const parsedVariants = computed(() => {
+      if (!report.value || !report.value.variant_analysis) return []
+      const lines = report.value.variant_analysis.split('\n')
+      const rows = []
+      // Find the ranked table lines (lines after the header/separator)
+      let inTable = false
+      for (const line of lines) {
+        if (line.includes('VARIANT RANKINGS')) { inTable = true; continue }
+        if (line.includes('DROPOUT') || line.includes('HOOK-TYPE')) { inTable = false }
+        if (!inTable) continue
+        // Skip header/separator lines
+        if (line.startsWith('-') || line.startsWith('Rank') || line.trim() === '') continue
+        // Parse data rows: rank, label, hook, open%, read%, reply%, fwd%, intent, score
+        const parts = line.trim().split(/\s{2,}/)
+        if (parts.length >= 7) {
+          rows.push({
+            label: parts[1]?.trim() || '',
+            hook: parts[2]?.trim() || '',
+            openPct: parts[3]?.trim() || '',
+            replyPct: parts[5]?.trim() || '',
+            intent: parts[7]?.trim() || '',
+            score: parts[8]?.trim() || '',
+          })
+        }
+      }
+      return rows
+    })
+
+    async function generateReport() {
+      if (!results.value || !results.value.variant_run_ids?.length) return
+      reportLoading.value = true
+      reportError.value = ''
+      reportStatus.value = 'Requesting report generation'
+      reportProgress.value = 5
+
+      // Use the first simulation_id from the variant run — the backend aggregates all
+      const simId = results.value.variant_run_ids[0].simulation_id
+      try {
+        const resp = await fetch('/api/report/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ simulation_id: simId }),
+        })
+        const data = await resp.json()
+        if (!data.success) throw new Error(data.error || 'Report generation failed')
+
+        const { report_id, task_id, already_generated } = data.data
+
+        if (already_generated) {
+          // Report already exists — fetch directly
+          await fetchReport(report_id)
+          return
+        }
+
+        // Poll for completion
+        pollReport(task_id, report_id)
+      } catch (e) {
+        reportError.value = e.message || 'Unexpected error'
+        reportLoading.value = false
+      }
+    }
+
+    function pollReport(taskId, reportId) {
+      reportPollTimer = setInterval(async () => {
+        try {
+          const resp = await fetch('/api/report/generate/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_id: taskId }),
+          })
+          const data = await resp.json()
+          if (!data.success) return
+
+          const { status, progress, message } = data.data
+          reportStatus.value = message || status
+          reportProgress.value = progress || 0
+
+          if (status === 'completed') {
+            clearInterval(reportPollTimer)
+            await fetchReport(reportId)
+          } else if (status === 'failed') {
+            clearInterval(reportPollTimer)
+            reportError.value = message || 'Report generation failed'
+            reportLoading.value = false
+          }
+        } catch (e) {
+          // Non-fatal — keep polling
+        }
+      }, 3000)
+    }
+
+    async function fetchReport(reportId) {
+      try {
+        const resp = await fetch(`/api/report/${reportId}`)
+        const data = await resp.json()
+        if (!data.success) throw new Error(data.error || 'Failed to fetch report')
+        report.value = data.data
+      } catch (e) {
+        reportError.value = e.message || 'Failed to load report'
+      } finally {
+        reportLoading.value = false
+      }
+    }
+
+    onUnmounted(() => {
+      if (reportPollTimer) clearInterval(reportPollTimer)
+    })
 
     onMounted(() => {
       loadProjects()
@@ -370,6 +670,15 @@ export default {
       viewSimulation,
       downloadResults,
       resetForm,
+      // Report
+      report,
+      reportLoading,
+      reportError,
+      reportStatus,
+      reportProgress,
+      parsedVariants,
+      generateReport,
+      allCompleted,
     }
   },
 }
@@ -790,5 +1099,132 @@ export default {
   border-radius: 6px;
   cursor: pointer;
   font-size: 13px;
+}
+
+/* Report section */
+.report-section {
+  background: #0d0d14;
+  border: 1px solid #1e1e2e;
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+.report-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.generate-report-btn {
+  background: #a78bfa;
+  color: #0a0a0f;
+  border: none;
+  padding: 8px 18px;
+  border-radius: 5px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.03em;
+}
+
+.generate-report-btn:hover {
+  background: #c4b5fd;
+}
+
+.report-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  flex-wrap: wrap;
+}
+
+.loading-ring.small {
+  width: 20px;
+  height: 20px;
+  border-width: 2px;
+  flex-shrink: 0;
+}
+
+.report-loading-text {
+  font-size: 13px;
+  color: #6b6b82;
+}
+
+.report-progress-bar {
+  width: 100%;
+  height: 3px;
+  background: #1e1e2e;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.report-progress-fill {
+  height: 100%;
+  background: #a78bfa;
+  transition: width 0.4s ease;
+}
+
+.winner-callout {
+  background: #12121f;
+  border: 1px solid #3b2a6b;
+  border-left: 3px solid #a78bfa;
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin-bottom: 20px;
+}
+
+.winner-callout-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #a78bfa;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.winner-callout-summary {
+  font-size: 14px;
+  color: #c4b5fd;
+  line-height: 1.5;
+}
+
+.ranked-variants {
+  margin-bottom: 20px;
+}
+
+.subsection-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #4b4b60;
+  margin-bottom: 12px;
+}
+
+.score-cell {
+  color: #a78bfa;
+  font-weight: 600;
+}
+
+.report-content {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.report-body-section {
+  border-top: 1px solid #111118;
+  padding-top: 16px;
+}
+
+.section-body {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #a0a0b4;
+  white-space: pre-wrap;
 }
 </style>
