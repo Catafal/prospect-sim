@@ -7,6 +7,7 @@ import os
 import io
 import csv
 import json
+import sqlite3
 import traceback
 import tempfile
 from datetime import datetime
@@ -893,8 +894,6 @@ def get_inbox_events(simulation_id: str):
         Events shape: {id, agent_name, variant_label, event_type, round_num, created_at}
         Returns empty events (not error) if simulation hasn't started yet.
     """
-    import sqlite3
-
     since_id = int(request.args.get('since_id', 0))
     sim_dir = os.path.join(Config.WONDERWALL_SIMULATION_DATA_DIR, simulation_id)
     db_path = os.path.join(sim_dir, "email_simulation.db")
@@ -903,6 +902,7 @@ def get_inbox_events(simulation_id: str):
     if not os.path.exists(db_path):
         return jsonify({"success": True, "data": {"events": [], "next_id": 0}})
 
+    conn = None
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -919,7 +919,6 @@ def get_inbox_events(simulation_id: str):
             "WHERE ie.id > ? ORDER BY ie.id ASC LIMIT 100",
             (since_id,)
         ).fetchall()
-        conn.close()
 
         events = [dict(r) for r in rows]
         next_id = events[-1]["id"] if events else since_id
@@ -928,6 +927,9 @@ def get_inbox_events(simulation_id: str):
     except Exception as e:
         logger.error(f"inbox-events failed for {simulation_id}: {e}")
         return jsonify({"success": True, "data": {"events": [], "next_id": since_id}})
+    finally:
+        if conn:
+            conn.close()
 
 
 @simulation_bp.route('/<simulation_id>/variant-results', methods=['GET'])
@@ -942,8 +944,6 @@ def get_variant_results(simulation_id: str):
     Returns structured JSON suitable for direct rendering (no text parsing needed).
     Returns data:null if no simulation data exists yet.
     """
-    import sqlite3
-
     try:
         mgr = SimulationManager()
         state = mgr.get_simulation(simulation_id)
@@ -974,6 +974,7 @@ def get_variant_results(simulation_id: str):
             db_path = os.path.join(Config.WONDERWALL_SIMULATION_DATA_DIR, sim_id, "email_simulation.db")
             if not os.path.exists(db_path):
                 continue
+            conn = None
             try:
                 conn = sqlite3.connect(db_path)
                 cur = conn.cursor()
@@ -1026,9 +1027,11 @@ def get_variant_results(simulation_id: str):
                         all_dropouts[lbl] = []
                     all_dropouts[lbl].append({"dropout_point": row[1], "count": row[2]})
 
-                conn.close()
             except Exception as e:
                 logger.warning(f"variant-results: DB query failed for {sim_id}: {e}")
+            finally:
+                if conn:
+                    conn.close()
 
         if not all_stats:
             return jsonify({"success": True, "data": None})

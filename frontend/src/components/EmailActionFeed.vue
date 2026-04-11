@@ -40,7 +40,6 @@ export default {
   props: {
     simulationId: { type: String,  required: true },
     active:       { type: Boolean, default: false },
-    agentCount:   { type: Number,  default: 0 },
   },
   setup(props) {
     const events = ref([])

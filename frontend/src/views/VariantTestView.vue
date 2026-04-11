@@ -83,7 +83,6 @@
           v-if="firstSimId"
           :simulationId="firstSimId"
           :active="loading"
-          :agentCount="personas.length"
         />
       </div>
     </div>
