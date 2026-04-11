@@ -877,6 +877,213 @@ def list_projects():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@simulation_bp.route('/<simulation_id>/inbox-events', methods=['GET'])
+def get_inbox_events(simulation_id: str):
+    """Stream per-agent action events from the email inbox simulation's SQLite DB.
+
+    Used by the live action feed in VariantTestView to show what agents are doing
+    in real-time during a simulation run. Polls the inbox_event table rather than
+    the JSONL log because EmailInboxPlatform writes per-agent actions only to SQLite.
+
+    Query params:
+        since_id (int, default 0): Return only rows with id > since_id (pagination cursor).
+
+    Returns:
+        {"success": true, "data": {"events": [...], "next_id": N}}
+        Events shape: {id, agent_name, variant_label, event_type, round_num, created_at}
+        Returns empty events (not error) if simulation hasn't started yet.
+    """
+    import sqlite3
+
+    since_id = int(request.args.get('since_id', 0))
+    sim_dir = os.path.join(Config.WONDERWALL_SIMULATION_DATA_DIR, simulation_id)
+    db_path = os.path.join(sim_dir, "email_simulation.db")
+
+    # Return empty gracefully — simulation may not have started yet
+    if not os.path.exists(db_path):
+        return jsonify({"success": True, "data": {"events": [], "next_id": 0}})
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # Join with user and email_variant tables for display names.
+        # LEFT JOINs so we don't fail if those tables aren't fully populated yet.
+        rows = conn.execute(
+            "SELECT ie.id, ie.agent_id, ie.variant_id, ie.round_num, ie.event_type, ie.created_at, "
+            "COALESCE(u.name, u.user_name, 'Agent_' || ie.agent_id) AS agent_name, "
+            "COALESCE(v.variant_label, 'Variant ' || ie.variant_id) AS variant_label "
+            "FROM inbox_event ie "
+            "LEFT JOIN user u ON ie.agent_id = u.user_id "
+            "LEFT JOIN email_variant v ON ie.variant_id = v.variant_id "
+            "WHERE ie.id > ? ORDER BY ie.id ASC LIMIT 100",
+            (since_id,)
+        ).fetchall()
+        conn.close()
+
+        events = [dict(r) for r in rows]
+        next_id = events[-1]["id"] if events else since_id
+        return jsonify({"success": True, "data": {"events": events, "next_id": next_id}})
+
+    except Exception as e:
+        logger.error(f"inbox-events failed for {simulation_id}: {e}")
+        return jsonify({"success": True, "data": {"events": [], "next_id": since_id}})
+
+
+@simulation_bp.route('/<simulation_id>/variant-results', methods=['GET'])
+def get_variant_results(simulation_id: str):
+    """Return structured variant performance data from email_simulation.db as JSON.
+
+    Used by EmailVariantReport component to display winner callout, dropout funnel,
+    and hook-type ranking without requiring a full LLM report to be generated first.
+    Queries ALL variant simulation DBs via project.variant_simulation_ids so the
+    comparison is across the full set of variants run together.
+
+    Returns structured JSON suitable for direct rendering (no text parsing needed).
+    Returns data:null if no simulation data exists yet.
+    """
+    import sqlite3
+
+    try:
+        mgr = SimulationManager()
+        state = mgr.get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": "Simulation not found"}), 404
+
+        project = ProjectManager.get_project(state.project_id)
+        if not project:
+            return jsonify({"success": False, "error": "Project not found"}), 404
+
+        # Build list of (variant_label, sim_id) pairs to query
+        sim_pairs = [
+            (entry.get("variant_label", f"Variant {entry.get('variant_id', i+1)}"),
+             entry.get("simulation_id", ""))
+            for i, entry in enumerate(getattr(project, "variant_simulation_ids", []))
+        ]
+        # Fallback to current simulation only
+        if not sim_pairs:
+            first_variant = project.variants[0] if project.variants else {}
+            sim_pairs = [(first_variant.get("label", "Variant A"), simulation_id)]
+
+        all_stats = []
+        all_dropouts = {}
+
+        for variant_label, sim_id in sim_pairs:
+            if not sim_id:
+                continue
+            db_path = os.path.join(Config.WONDERWALL_SIMULATION_DATA_DIR, sim_id, "email_simulation.db")
+            if not os.path.exists(db_path):
+                continue
+            try:
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+
+                # Per-variant engagement rates
+                cur.execute(
+                    "SELECT v.variant_id, v.variant_label, v.hook_type, "
+                    "COUNT(DISTINCT s.agent_id) as total_agents, "
+                    "SUM(COALESCE(s.opened, 0)) as total_opens, "
+                    "SUM(COALESCE(s.read_to_completion, 0)) as total_reads, "
+                    "SUM(COALESCE(s.replied, 0)) as total_replies, "
+                    "SUM(COALESCE(s.forwarded, 0)) as total_forwards, "
+                    "AVG(COALESCE(s.reply_intent_score, 0)) as avg_intent "
+                    "FROM email_variant v "
+                    "LEFT JOIN agent_inbox_state s ON v.variant_id = s.variant_id "
+                    "GROUP BY v.variant_id ORDER BY total_replies DESC"
+                )
+                for row in cur.fetchall():
+                    agents = row[3] or 1
+                    opens, reads, replies, forwards = row[4] or 0, row[5] or 0, row[6] or 0, row[7] or 0
+                    avg_intent = round(float(row[8] or 0), 3)
+                    open_rate = round(opens / agents, 3)
+                    read_rate = round(reads / agents, 3)
+                    reply_rate = round(replies / agents, 3)
+                    forward_rate = round(forwards / agents, 3)
+                    composite = round(reply_rate * 3 + forward_rate * 2 + open_rate, 3)
+                    all_stats.append({
+                        "variant_label": row[1],
+                        "hook_type": row[2],
+                        "total_agents": row[3] or 0,
+                        "open_rate": open_rate,
+                        "read_rate": read_rate,
+                        "reply_rate": reply_rate,
+                        "forward_rate": forward_rate,
+                        "avg_intent_score": avg_intent,
+                        "composite_score": composite,
+                    })
+
+                # Dropout breakdown
+                cur.execute(
+                    "SELECT v.variant_label, s.dropout_point, COUNT(*) as count "
+                    "FROM agent_inbox_state s "
+                    "JOIN email_variant v ON s.variant_id = v.variant_id "
+                    "WHERE s.dropout_point IS NOT NULL "
+                    "GROUP BY v.variant_id, s.dropout_point ORDER BY count DESC"
+                )
+                for row in cur.fetchall():
+                    lbl = row[0]
+                    if lbl not in all_dropouts:
+                        all_dropouts[lbl] = []
+                    all_dropouts[lbl].append({"dropout_point": row[1], "count": row[2]})
+
+                conn.close()
+            except Exception as e:
+                logger.warning(f"variant-results: DB query failed for {sim_id}: {e}")
+
+        if not all_stats:
+            return jsonify({"success": True, "data": None})
+
+        # Sort by composite score — this is the ranking
+        all_stats.sort(key=lambda x: x["composite_score"], reverse=True)
+
+        winner = all_stats[0]
+        runner_up_delta = None
+        if len(all_stats) > 1:
+            runner = all_stats[1]
+            runner_up_delta = {
+                "label": runner["variant_label"],
+                "reply_rate_diff": round(winner["reply_rate"] - runner["reply_rate"], 3),
+            }
+
+        # Hook-type aggregation across all variants
+        hook_data = {}
+        for v in all_stats:
+            ht = v["hook_type"]
+            if ht not in hook_data:
+                hook_data[ht] = {"reply_rates": [], "open_rates": []}
+            hook_data[ht]["reply_rates"].append(v["reply_rate"])
+            hook_data[ht]["open_rates"].append(v["open_rate"])
+        hook_types = sorted([
+            {
+                "hook_type": ht,
+                "avg_reply_rate": round(sum(d["reply_rates"]) / len(d["reply_rates"]), 3),
+                "avg_open_rate": round(sum(d["open_rates"]) / len(d["open_rates"]), 3),
+                "count": len(d["reply_rates"]),
+            }
+            for ht, d in hook_data.items()
+        ], key=lambda x: x["avg_reply_rate"], reverse=True)
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "variants": all_stats,
+                "winner": {
+                    "variant_label": winner["variant_label"],
+                    "hook_type": winner["hook_type"],
+                    "composite_score": winner["composite_score"],
+                    "reply_rate": winner["reply_rate"],
+                },
+                "runner_up_delta": runner_up_delta,
+                "dropouts": all_dropouts,
+                "hook_types": hook_types,
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"variant-results failed for {simulation_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 def _get_report_id_for_simulation(simulation_id: str) -> str:
     """
     Get the latest report_id corresponding to a simulation
@@ -1132,8 +1339,10 @@ def get_simulation_profiles_realtime(simulation_id: str):
                 "error": f"Simulation not found: {simulation_id}"
             }), 404
 
-        # Determine file path
-        if platform == "reddit":
+        # Determine file path — email_inbox uses its own JSON profile format
+        if platform == "email_inbox":
+            profiles_file = os.path.join(sim_dir, "email_inbox_profiles.json")
+        elif platform == "reddit":
             profiles_file = os.path.join(sim_dir, "reddit_profiles.json")
         else:
             profiles_file = os.path.join(sim_dir, "twitter_profiles.csv")
