@@ -1342,9 +1342,11 @@ def get_simulation_profiles_realtime(simulation_id: str):
                 "error": f"Simulation not found: {simulation_id}"
             }), 404
 
-        # Determine file path — email_inbox uses its own JSON profile format
+        # Determine file path — email_inbox and linkedin_outreach use JSON profile format
         if platform == "email_inbox":
             profiles_file = os.path.join(sim_dir, "email_inbox_profiles.json")
+        elif platform == "linkedin_outreach":
+            profiles_file = os.path.join(sim_dir, "linkedin_outreach_profiles.json")
         elif platform == "reddit":
             profiles_file = os.path.join(sim_dir, "reddit_profiles.json")
         else:
@@ -1939,10 +1941,10 @@ def start_simulation():
                     "error": "max_rounds must be a valid integer"
                 }), 400
 
-        if platform not in ['twitter', 'reddit', 'parallel', 'email_inbox']:
+        if platform not in ['twitter', 'reddit', 'parallel', 'email_inbox', 'linkedin_outreach']:
             return jsonify({
                 "success": False,
-                "error": f"Invalid platform type: {platform}, options: twitter/reddit/parallel/email_inbox"
+                "error": f"Invalid platform type: {platform}, options: twitter/reddit/parallel/email_inbox/linkedin_outreach"
             }), 400
 
         enable_cross_platform = data.get('enable_cross_platform', True)

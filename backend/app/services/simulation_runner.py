@@ -711,7 +711,7 @@ class SimulationRunner:
                                     state.simulated_hours = max(
                                         state.twitter_simulated_hours,
                                         state.reddit_simulated_hours,
-                                        simulated_hours if platform == "email_inbox" else 0,
+                                        simulated_hours if platform in ("email_inbox", "linkedin_outreach") else 0,
                                     )
                                 
                                 continue

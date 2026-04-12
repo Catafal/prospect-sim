@@ -54,6 +54,15 @@ class OasisAgentProfile:
     pain_signal_sensitivity: Dict[str, float] = field(default_factory=dict)  # pain_type → 0-1
     decision_style: str = "roi_driven"       # roi_driven | risk_averse | early_adopter | social_proof
 
+    # LinkedIn outreach simulation fields
+    # These are populated when simulation_type == "linkedin_outreach"
+    title: str = ""                          # Short job title label (e.g. "VP Sales")
+    seniority: str = "manager"               # c-suite | vp | director | manager | individual_contributor
+    company_size: str = "smb"                # startup | smb | mid-market | enterprise
+    industry: str = "tech"                   # Industry vertical (e.g. "SaaS", "FinTech")
+    activity_level: str = "weekly"           # daily | weekly | occasional (LinkedIn usage frequency)
+    connection_receptiveness: float = 0.25   # 0.0–1.0 probability of accepting a cold connection
+
     # Additional persona information
     age: Optional[int] = None
     gender: Optional[str] = None
@@ -176,6 +185,13 @@ class OasisAgentProfile:
             "inbox_habit": self.inbox_habit,
             "pain_signal_sensitivity": self.pain_signal_sensitivity,
             "decision_style": self.decision_style,
+            # LinkedIn outreach fields
+            "title": self.title,
+            "seniority": self.seniority,
+            "company_size": self.company_size,
+            "industry": self.industry,
+            "activity_level": self.activity_level,
+            "connection_receptiveness": self.connection_receptiveness,
         }
 
 
@@ -398,6 +414,13 @@ class OasisProfileGenerator:
             inbox_habit=profile_data.get("inbox_habit", "batch_processor"),
             pain_signal_sensitivity=profile_data.get("pain_signal_sensitivity", {}),
             decision_style=profile_data.get("decision_style", "roi_driven"),
+            # LinkedIn outreach fields — populated when simulation_type == "linkedin_outreach"
+            title=profile_data.get("title", ""),
+            seniority=profile_data.get("seniority", "manager"),
+            company_size=profile_data.get("company_size", "smb"),
+            industry=profile_data.get("industry", "tech"),
+            activity_level=profile_data.get("activity_level", "weekly"),
+            connection_receptiveness=float(profile_data.get("connection_receptiveness", 0.25)),
         )
     
     def _generate_username(self, name: str) -> str:
@@ -663,6 +686,11 @@ class OasisProfileGenerator:
         # B2B email inbox mode: always generate B2B decision-maker personas
         if self.simulation_type == "email_inbox":
             prompt = self._build_b2b_persona_prompt(
+                entity_name, entity_type, entity_summary, entity_attributes, context
+            )
+        # LinkedIn outreach mode: generate B2B LinkedIn personas with connection behavior fields
+        elif self.simulation_type == "linkedin_outreach":
+            prompt = self._build_linkedin_persona_prompt(
                 entity_name, entity_type, entity_summary, entity_attributes, context
             )
         elif is_individual:
@@ -989,6 +1017,74 @@ IMPORTANT: Vary the personas meaningfully. Not all HR Directors are the same.
 Some are overwhelmed solo HR in a fast-growing startup. Others are seasoned professionals
 at established companies with clear L&D gaps. Make each one a real person.
 Do NOT include karma, friend_count, follower_count, or statuses_count.
+"""
+
+    def _build_linkedin_persona_prompt(
+        self,
+        entity_name: str,
+        entity_type: str,
+        entity_summary: str,
+        entity_attributes: Dict[str, Any],
+        context: str
+    ) -> str:
+        """Build B2B LinkedIn persona prompt for LinkedIn outreach simulation.
+
+        Generates a realistic B2B decision-maker who receives connection requests on LinkedIn.
+        Fields map 1:1 to what run_linkedin_outreach_simulation.py reads via profile_to_user_info().
+
+        Key behavioral fields:
+        - connection_receptiveness: probability of accepting a cold connection (0.1–0.5 realistic)
+        - activity_level: how often they check LinkedIn ("daily", "weekly", "occasional")
+        - seniority: "c-suite", "vp", "director", "manager", "individual_contributor"
+        """
+        attrs_str = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "None"
+        context_str = context[:3000] if context else "No additional context"
+
+        return f"""Create a B2B decision-maker persona for a LinkedIn outreach simulation.
+This persona represents someone who receives cold LinkedIn connection requests from sales reps.
+
+SOURCE ENTITY: {entity_name} ({entity_type})
+ENTITY SUMMARY: {entity_summary}
+ATTRIBUTES: {attrs_str}
+
+CONTEXT (from ICP profile and knowledge graph):
+{context_str}
+
+SIMULATION GOAL: {self.simulation_requirement[:500] if self.simulation_requirement else "B2B LinkedIn outreach copy variant testing"}
+
+Return JSON with these fields:
+
+"bio": Short professional bio (2 sentences). Real LinkedIn bio style — specific title, company type, years of experience.
+
+"persona": Character description for the simulation (400-600 words). Include:
+- Current role, company context (industry, size, growth stage)
+- How frequently they use LinkedIn and for what purpose (hiring, content, networking, sales)
+- Their attitude toward cold connection requests — do they read notes? Accept freely? Ignore most?
+- Top 3 current work priorities (affects receptiveness to specific value propositions)
+- Relationship with vendors/sales: open to new tools? gatekeeping? exploring options?
+- What makes them accept a connection vs ignore it?
+
+"age": Integer (30-55, realistic for the role)
+"gender": "male" or "female"
+"mbti": MBTI type (vary across the pool — ENTJ, INTJ, ESTJ, ENFJ, ISTJ are common in B2B)
+"country": Country where they work (vary for international GTM realism)
+"profession": Exact job title (e.g. "Head of Engineering", "VP Sales", "Procurement Manager")
+"interested_topics": 4-6 specific LinkedIn topics they engage with
+
+"title": Short title label (e.g. "Head of Engineering", "VP Sales")
+"seniority": one of "c-suite" | "vp" | "director" | "manager" | "individual_contributor"
+"company_size": one of "startup" (1-50) | "smb" (51-250) | "mid-market" (251-1000) | "enterprise" (1000+)
+"industry": Industry vertical (e.g. "SaaS", "FinTech", "Manufacturing", "Healthcare", "E-commerce")
+"activity_level": one of "daily" | "weekly" | "occasional"
+  (daily = checks LinkedIn every workday; weekly = a few times/week; occasional = rarely)
+"connection_receptiveness": float 0.0-1.0 — probability they accept cold connection requests
+  Calibration: c-suite typically 0.1-0.2, directors 0.2-0.35, managers 0.25-0.45
+  Higher if they are actively hiring or building a network, lower if bombarded with outreach
+
+IMPORTANT: Vary the personas meaningfully. A CTO at a 20-person startup has very different LinkedIn
+behavior than a Procurement Director at a 5000-person enterprise.
+Do NOT include karma, friend_count, follower_count, statuses_count, budget_authority,
+cold_email_skepticism, inbox_habit, pain_signal_sensitivity, or decision_style.
 """
 
     def _generate_profile_rule_based(
@@ -1448,7 +1544,16 @@ Do NOT include karma, friend_count, follower_count, or statuses_count.
                 item["profession"] = profile.profession
             if profile.interested_topics:
                 item["interested_topics"] = profile.interested_topics
-            
+
+            # LinkedIn outreach fields — included when present (non-default values signal LinkedIn sim)
+            if profile.title:
+                item["title"] = profile.title
+                item["seniority"] = profile.seniority
+                item["company_size"] = profile.company_size
+                item["industry"] = profile.industry
+                item["activity_level"] = profile.activity_level
+                item["connection_receptiveness"] = profile.connection_receptiveness
+
             data.append(item)
         
         with open(file_path, 'w', encoding='utf-8') as f:
