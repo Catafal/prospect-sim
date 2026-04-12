@@ -400,6 +400,10 @@ class SimulationRunner:
             # B2B email variant simulation — runs EmailInboxPlatform against HR Director personas
             script_name = "run_email_inbox_simulation.py"
             state.email_inbox_running = True
+        elif platform == "linkedin_outreach":
+            # B2B LinkedIn copy variant simulation — runs LinkedInOutreachPlatform against decision-maker personas
+            script_name = "run_linkedin_outreach_simulation.py"
+            state.linkedin_running = True
         else:
             script_name = "run_parallel_simulation.py"
             state.twitter_running = True
@@ -670,6 +674,10 @@ class SimulationRunner:
                                         # Email inbox variant simulation completed
                                         state.email_inbox_running = False
                                         logger.info(f"Email inbox simulation completed: {state.simulation_id}, total_rounds={action_data.get('total_rounds')}")
+                                    elif platform == "linkedin_outreach":
+                                        # LinkedIn outreach variant simulation completed
+                                        state.linkedin_running = False
+                                        logger.info(f"LinkedIn outreach simulation completed: {state.simulation_id}, total_rounds={action_data.get('total_rounds')}")
 
                                     # Check if all enabled platforms are completed
                                     # If only one platform was running, only check that one
@@ -750,23 +758,28 @@ class SimulationRunner:
         twitter_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
         reddit_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
         email_inbox_log = os.path.join(sim_dir, "email_inbox", "actions.jsonl")
+        linkedin_log = os.path.join(sim_dir, "linkedin_outreach", "actions.jsonl")
 
         # Check which platforms are active (determined by log file existence)
         twitter_enabled = os.path.exists(twitter_log)
         reddit_enabled = os.path.exists(reddit_log)
         email_inbox_enabled = os.path.exists(email_inbox_log)
+        linkedin_enabled = os.path.exists(linkedin_log)
 
         # If a platform is active but not yet marked completed, return False
         if twitter_enabled and not state.twitter_completed:
             return False
         if reddit_enabled and not state.reddit_completed:
             return False
-        # email_inbox completion is signalled by the simulation_end event clearing email_inbox_running
+        # email_inbox completion is signalled by simulation_end event clearing email_inbox_running
         if email_inbox_enabled and getattr(state, "email_inbox_running", False):
+            return False
+        # linkedin_outreach completion is signalled by simulation_end event clearing linkedin_running
+        if linkedin_enabled and getattr(state, "linkedin_running", False):
             return False
 
         # At least one platform must be active
-        return twitter_enabled or reddit_enabled or email_inbox_enabled
+        return twitter_enabled or reddit_enabled or email_inbox_enabled or linkedin_enabled
     
     @classmethod
     def _terminate_process(cls, process: subprocess.Popen, simulation_id: str, timeout: int = 10):
