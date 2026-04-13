@@ -40,6 +40,7 @@ from .client import ApiClient, ApiError
 from .tui_constants import (
     ORANGE, DIM, SPINNER, DROPOUT_COLORS,
     SLASH_COMMANDS, CONFIG_KEYS, LOGO, LOGO_COMPACT,
+    LINKEDIN_APPROACH_TYPES,
 )
 from .tui_config import TuiConfigMixin
 from .tui_graph import TuiGraphMixin
@@ -429,10 +430,6 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
 
     # ── LinkedIn commands ─────────────────────────────────────────────────────
 
-    _LINKEDIN_APPROACH_TYPES = [
-        "personalized", "value_prop", "mutual_interest", "direct", "question_based"
-    ]
-
     def _cmd_add_linkedin(self) -> None:
         """
         Interactive wizard: add a LinkedIn outreach variant to linkedin_variants.
@@ -477,7 +474,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             return
 
         # Approach type — show choices inline
-        choices_str = " | ".join(self._LINKEDIN_APPROACH_TYPES)
+        choices_str = " | ".join(LINKEDIN_APPROACH_TYPES)
         self._print_hint(f"Approach types: {choices_str}")
         approach_type = ""
         while True:
@@ -487,7 +484,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             if not approach_type:
                 self._print_hint("Cancelled.")
                 return
-            if approach_type not in self._LINKEDIN_APPROACH_TYPES:
+            if approach_type not in LINKEDIN_APPROACH_TYPES:
                 self._print_err(f"Invalid approach type. Choose from: {choices_str}")
                 continue
             break
@@ -529,6 +526,12 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             self._print_err(f"Unknown /linkedin sub-command: '{sub}'. Try /linkedin add, /linkedin variants, /linkedin run.")
             return
 
+        # ICP must be loaded before we do anything — check early so the error is clean,
+        # even if the user typed /linkedin with the intent to build variants first.
+        if not self.icp_path or not self.project_id:
+            self._print_err("No ICP loaded. Run /icp <file> first.")
+            return
+
         # No sub-command (or "run") — start builder if no variants, else run simulation
         if not self.linkedin_variants and sub != "run":
             self._print_hint("No LinkedIn variants yet. Starting variant builder…")
@@ -536,9 +539,6 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             if not self.linkedin_variants:
                 return  # User cancelled the builder
 
-        if not self.icp_path or not self.project_id:
-            self._print_err("No ICP loaded. Run /icp <file> first.")
-            return
         if not self.linkedin_variants:
             self._print_err("No LinkedIn variants. Use /linkedin add to create at least one.")
             return

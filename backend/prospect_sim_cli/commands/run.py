@@ -25,12 +25,14 @@ from ..output import (
     print_error, print_info, print_success, print_json,
     print_ranking_table, spinner,
 )
+from ..tui_constants import LINKEDIN_APPROACH_TYPES
 
 app = typer.Typer(help="Run a full variant test: build ICP graph + simulate + rank.")
 
 
 _LINKEDIN_REQUIRED_FIELDS = {"connection_note", "opening_message", "approach_type"}
-_LINKEDIN_APPROACH_TYPES = {"personalized", "value_prop", "mutual_interest", "direct", "question_based"}
+# Convert to set for O(1) lookup — source of truth is tui_constants.LINKEDIN_APPROACH_TYPES
+_LINKEDIN_APPROACH_TYPES = set(LINKEDIN_APPROACH_TYPES)
 
 
 def _validate_linkedin_variants(variants: list[dict]) -> None:

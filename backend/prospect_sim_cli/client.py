@@ -363,7 +363,9 @@ class ApiClient:
     def get_linkedin_variant_results(self, simulation_id: str) -> Optional[dict]:
         """
         Fetch structured LinkedIn variant performance data.
-        Returns data dict with variants/winner/dropouts/approach_types, or None if no data yet.
+        Returns data dict with variants/winner/dropouts/approach_types.
+        Returns None when the backend has no simulation data yet (backend returns data:null).
+        Raises ApiError on network failure or backend error.
         """
         return self._get(f"/api/simulation/{simulation_id}/linkedin-variant-results")
 
