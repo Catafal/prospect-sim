@@ -86,11 +86,20 @@ def print_info(message: str, quiet: bool = False) -> None:
         sys.stderr.write(f"  {message}\n")
 
 
-def print_ranking_table(ranking: list[dict], failure_points: dict) -> None:
+def print_ranking_table(
+    ranking: list[dict],
+    failure_points: dict,
+    platform: str = "email",
+) -> None:
     """
     Render variant ranking as a rich table.
-    Winner gets a trophy. Failure points color-coded.
+    Winner gets a trophy. Failure points color-coded (email only).
+    platform: "email" (default) or "linkedin" — controls which columns are shown.
     """
+    if platform == "linkedin":
+        _print_linkedin_ranking_table(ranking)
+        return
+
     if not _RICH or not _console:
         # Fallback: plain text
         for i, entry in enumerate(ranking):
@@ -130,6 +139,50 @@ def print_ranking_table(ranking: list[dict], failure_points: dict) -> None:
             str(entry.get("open_score", "—")),
             str(entry.get("reply_score", "—")),
             f"[{color}]{dropout}[/{color}]",
+        )
+
+    _console.print(table)
+
+
+def _print_linkedin_ranking_table(variants: list[dict]) -> None:
+    """
+    Render LinkedIn variant ranking with LinkedIn-specific metrics.
+    Columns: Accept% / View% / Reply% / Composite score.
+    """
+    if not _RICH or not _console:
+        for i, v in enumerate(variants):
+            marker = "👑 WINNER" if i == 0 else f"  #{i + 1}"
+            print(f"{marker}  {v.get('variant_label', '?')}")
+            print(f"      Accept: {v.get('accept_rate', 'n/a')}  "
+                  f"View: {v.get('view_rate', 'n/a')}  "
+                  f"Reply: {v.get('reply_rate', 'n/a')}  "
+                  f"Composite: {v.get('composite_score', 'n/a')}")
+        return
+
+    table = Table(title="LinkedIn Variant Ranking", show_header=True, header_style="bold cyan")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Variant", min_width=20)
+    table.add_column("Approach", min_width=14)
+    table.add_column("Accept%", justify="right")
+    table.add_column("View%", justify="right")
+    table.add_column("Reply%", justify="right")
+    table.add_column("Composite", justify="right")
+
+    for i, v in enumerate(variants):
+        rank = "👑 1" if i == 0 else f"  {i + 1}"
+        # Format rates as percentages
+        accept = f"{v.get('accept_rate', 0) * 100:.1f}%"
+        view = f"{v.get('view_rate', 0) * 100:.1f}%"
+        reply = f"{v.get('reply_rate', 0) * 100:.1f}%"
+        composite = f"{v.get('composite_score', 0):.3f}"
+        table.add_row(
+            rank,
+            v.get("variant_label", "—"),
+            v.get("approach_type", "—"),
+            accept,
+            view,
+            reply,
+            composite,
         )
 
     _console.print(table)

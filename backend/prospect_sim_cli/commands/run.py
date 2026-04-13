@@ -25,8 +25,45 @@ from ..output import (
     print_error, print_info, print_success, print_json,
     print_ranking_table, spinner,
 )
+from ..tui_constants import LINKEDIN_APPROACH_TYPES
 
 app = typer.Typer(help="Run a full variant test: build ICP graph + simulate + rank.")
+
+
+_LINKEDIN_REQUIRED_FIELDS = {"connection_note", "opening_message", "approach_type"}
+# Convert to set for O(1) lookup — source of truth is tui_constants.LINKEDIN_APPROACH_TYPES
+_LINKEDIN_APPROACH_TYPES = set(LINKEDIN_APPROACH_TYPES)
+
+
+def _validate_linkedin_variants(variants: list[dict]) -> None:
+    """
+    Exit with a clear error if any LinkedIn variant is missing required fields.
+    Called before any API requests so the user gets fast feedback.
+    """
+    for i, v in enumerate(variants):
+        missing = _LINKEDIN_REQUIRED_FIELDS - set(v.keys())
+        if missing:
+            print_error(
+                "invalid_linkedin_variant",
+                f"Variant {i + 1} ('{v.get('label', '?')}') is missing LinkedIn fields: {', '.join(sorted(missing))}",
+                fix='Each LinkedIn variant needs: {"label":"...","connection_note":"...","opening_message":"...","approach_type":"personalized"}',
+                exit_code=1,
+            )
+        note = v.get("connection_note", "")
+        if len(note) > 300:
+            print_error(
+                "connection_note_too_long",
+                f"Variant {i + 1}: connection_note is {len(note)} chars (LinkedIn hard limit: 300)",
+                fix="Shorten the connection_note to 300 characters or fewer",
+                exit_code=1,
+            )
+        if v.get("approach_type") not in _LINKEDIN_APPROACH_TYPES:
+            print_error(
+                "invalid_approach_type",
+                f"Variant {i + 1}: approach_type '{v.get('approach_type')}' is not valid",
+                fix=f"Valid approach_type values: {', '.join(sorted(_LINKEDIN_APPROACH_TYPES))}",
+                exit_code=1,
+            )
 
 
 def _load_variants(variants_path: Path) -> list[dict]:
@@ -64,21 +101,28 @@ def _print_dry_run_plan(
     cached_project_id: Optional[str],
     rounds: int,
     parallel: bool,
+    platform: str = "email",
 ) -> None:
     """
     Print what would happen without executing anything.
-    Rule 7: --dry-run mode.
+    Rule 7: --dry-run mode. Branches on platform for variant field display.
     """
     cache_status = f"✓ cached ({cached_project_id})" if cached_project_id else "✗ not cached — will build"
     mode = "parallel" if parallel else "sequential"
 
-    typer.echo(f"\n[dry-run] prospect-sim run")
+    typer.echo(f"\n[dry-run] prospect-sim run --platform {platform}")
     typer.echo(f"  ICP file:    {icp}")
     typer.echo(f"  ICP hash:    {icp_hash[:12]}...")
     typer.echo(f"  Graph:       {cache_status}")
     typer.echo(f"  Variants:    {len(variants)}")
     for v in variants:
-        typer.echo(f"    [{v.get('hook_type','?')}] {v.get('label','?')}")
+        if platform == "linkedin":
+            # Show LinkedIn-specific fields: approach_type + connection_note preview
+            note = v.get("connection_note", "")
+            note_preview = note[:60] + "…" if len(note) > 60 else note
+            typer.echo(f"    [{v.get('approach_type','?')}] {v.get('label','?')} — \"{note_preview}\"")
+        else:
+            typer.echo(f"    [{v.get('hook_type','?')}] {v.get('label','?')}")
     typer.echo(f"  Rounds:      {rounds}")
     typer.echo(f"  Run mode:    {mode}")
     build_time = "~30 sec (cached)" if cached_project_id else "~5-10 min (graph build)"
@@ -92,21 +136,33 @@ def _build_icp_graph(
     icp: Path,
     icp_hash: str,
     quiet: bool,
+    simulation_type: str = "email_inbox",
 ) -> str:
     """
     Upload ICP file, generate ontology, build graph, cache project_id.
     Returns project_id.
+    simulation_type controls which persona generator is used during prepare.
     """
     project_name = icp.stem.replace("-", " ").replace("_", " ").title()
-    requirement = (
-        "Test B2B cold email copy variants against HR Director / Head of People personas. "
-        "Focus on open rate, reply intent, and dropout point analysis."
-    )
+
+    # Requirement text differs by platform — guide the ontology toward right persona signals
+    if simulation_type == "linkedin_outreach":
+        requirement = (
+            "Test LinkedIn outreach copy variants against B2B decision-maker personas. "
+            "Focus on connection acceptance rate, profile view rate, and reply intent."
+        )
+    else:
+        requirement = (
+            "Test B2B cold email copy variants against HR Director / Head of People personas. "
+            "Focus on open rate, reply intent, and dropout point analysis."
+        )
 
     # Step 1: upload + ontology
     print_info("Uploading ICP file and generating ontology...", quiet)
     with spinner("Generating ontology...", quiet):
-        ontology_result = client.generate_ontology(icp, project_name, requirement)
+        ontology_result = client.generate_ontology(
+            icp, project_name, requirement, simulation_type=simulation_type,
+        )
 
     project_id = ontology_result.get("project_id")
     if not project_id:
@@ -159,6 +215,48 @@ def _run_simulations(
 
     # Poll all simulations until complete
     print_info(f"Running {len(run_ids)} simulation(s) ({rounds} rounds each)...", quiet)
+    for entry in run_ids:
+        sim_id = entry["simulation_id"]
+        label = entry.get("variant_label", sim_id)
+        with spinner(f"Simulating '{label}'...", quiet):
+            client.poll_simulation(sim_id)
+        print_success(f"Simulation complete: '{label}'", quiet)
+
+    return run_ids
+
+
+def _run_simulations_linkedin(
+    client: ApiClient,
+    project_id: str,
+    variants: list[dict],
+    simulation_requirement: str,
+    parallel: bool,
+    rounds: int,
+    quiet: bool,
+) -> list[dict]:
+    """
+    Create, prepare (linkedin_outreach), start, and poll all LinkedIn variant simulations.
+    Mirrors _run_simulations() but calls run_linkedin_test() and passes simulation_type to prepare.
+    Returns list of completed run_id dicts.
+    """
+    print_info(f"Creating {len(variants)} LinkedIn simulation(s)...", quiet)
+    run_ids = client.run_linkedin_test(
+        project_id, variants, simulation_requirement, parallel, rounds,
+    )
+
+    # Prepare and start each simulation with linkedin_outreach type
+    for entry in run_ids:
+        sim_id = entry["simulation_id"]
+        label = entry.get("variant_label", sim_id)
+        print_info(f"Preparing simulation for '{label}'...", quiet)
+        with spinner(f"Preparing '{label}'...", quiet):
+            task_id = client.prepare_simulation(sim_id, simulation_type="linkedin_outreach")
+            client.poll_task(task_id, timeout=300)
+        client.start_simulation(sim_id)
+        print_info(f"Started simulation for '{label}'", quiet)
+
+    # Poll all simulations until complete
+    print_info(f"Running {len(run_ids)} LinkedIn simulation(s) ({rounds} rounds each)...", quiet)
     for entry in run_ids:
         sim_id = entry["simulation_id"]
         label = entry.get("variant_label", sim_id)
@@ -226,20 +324,30 @@ def run(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Show execution plan without running")] = False,
     quiet: Annotated[bool, typer.Option("--quiet", help="Output clean JSON only (pipeable)")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompts (unattended)")] = False,
+    platform: Annotated[str, typer.Option("--platform", help="Simulation platform: email (default) or linkedin")] = "email",
     api_url: Annotated[str, typer.Option("--api-url", envvar="PROSPECT_SIM_API_URL", help="Backend URL", hidden=True)] = "",
 ) -> None:
     """
-    Run a full B2B cold email variant test.
+    Run a full B2B variant test (email or LinkedIn).
 
-    Builds ICP knowledge graph (cached after first run), simulates each email
-    variant against synthetic decision-maker personas, and ranks by reply intent.
+    Builds ICP knowledge graph (cached after first run), simulates each variant
+    against synthetic decision-maker personas, and ranks by engagement metrics.
 
     Examples:
       prospect-sim run --icp icp.md --variants variants.json
+      prospect-sim run --icp icp.md --variants linkedin.json --platform linkedin
       prospect-sim run --icp icp.md --variants variants.json --parallel --rounds 12
       prospect-sim run --icp icp.md --variants variants.json --dry-run
       prospect-sim run --icp icp.md --variants variants.json --quiet | jq '.winner'
     """
+    # Validate platform flag early — before any file I/O
+    if platform not in ("email", "linkedin"):
+        print_error(
+            "invalid_platform",
+            f"Unknown platform '{platform}'. Valid values: email, linkedin",
+            exit_code=1,
+        )
+
     # Resolve API URL (flag > env > config file)
     config = CliConfig()
     resolved_url = api_url or config.get("api_url") or "http://localhost:5001"
@@ -254,6 +362,11 @@ def run(
         print_error("variants_file_not_found", f"Variants file not found: {variants}", exit_code=1)
 
     variants_data = _load_variants(variants)
+
+    # LinkedIn-specific field validation — before any API calls (DC-3)
+    if platform == "linkedin":
+        _validate_linkedin_variants(variants_data)
+
     icp_hash = cache.hash_file(icp)
 
     # ── Cache check ──────────────────────────────────────────────────────
@@ -274,7 +387,7 @@ def run(
 
     # ── Dry run ──────────────────────────────────────────────────────────
     if dry_run:
-        _print_dry_run_plan(icp, variants_data, icp_hash, cached_project_id, rounds, parallel)
+        _print_dry_run_plan(icp, variants_data, icp_hash, cached_project_id, rounds, parallel, platform)
         raise typer.Exit(0)
 
     # ── Backend health check ─────────────────────────────────────────────
@@ -288,6 +401,7 @@ def run(
         )
 
     # ── Phase 1: ICP graph build (skip if cached) ─────────────────────────
+    sim_type = "linkedin_outreach" if platform == "linkedin" else "email_inbox"
     project_id = cached_project_id
     if not project_id:
         if not yes:
@@ -297,11 +411,42 @@ def run(
                 abort=True,
             )
         try:
-            project_id = _build_icp_graph(client, cache, icp, icp_hash, quiet)
+            project_id = _build_icp_graph(client, cache, icp, icp_hash, quiet, simulation_type=sim_type)
         except ApiError as exc:
             print_error(exc.code, exc.message, exc.fix, exc.docs, exit_code=2)
 
     # ── Phase 2: Variant simulations ─────────────────────────────────────
+    if platform == "linkedin":
+        simulation_requirement = (
+            "Rank LinkedIn outreach variants by reply and connection acceptance. "
+            "Identify which approach_type drives the highest accept and reply rates."
+        )
+        try:
+            run_ids = _run_simulations_linkedin(
+                client, project_id, variants_data,
+                simulation_requirement, parallel, rounds, quiet,
+            )
+        except ApiError as exc:
+            print_error(exc.code, exc.message, exc.fix, exc.docs, exit_code=2)
+
+        # Fetch LinkedIn variant results directly (no ReACT report agent needed)
+        print_info("Fetching LinkedIn variant results...", quiet)
+        try:
+            results_data = client.get_linkedin_variant_results(run_ids[0]["simulation_id"])
+        except ApiError as exc:
+            print_error(exc.code, exc.message, exc.fix, exc.docs, exit_code=2)
+
+        if quiet:
+            print_json(results_data or {})
+        else:
+            variants_ranked = (results_data or {}).get("variants", [])
+            print_ranking_table(variants_ranked, {}, platform="linkedin")
+            winner = (results_data or {}).get("winner", {})
+            if winner:
+                typer.echo(f"\n🏆 Winner: {winner.get('variant_label')} ({winner.get('approach_type')})\n")
+        return
+
+    # ── Email path (default) — unchanged ─────────────────────────────────
     simulation_requirement = (
         "Rank email copy variants by reply intent. Identify dropout points "
         "(subject_line / opening / body / cta) for each variant."

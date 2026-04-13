@@ -21,9 +21,16 @@ DROPOUT_COLORS = {
     "n/a": "dim",
 }
 
+# LinkedIn approach types — canonical list used by both tui.py and commands/run.py
+# Ordered for display; converted to set for O(1) lookup where needed.
+LINKEDIN_APPROACH_TYPES = [
+    "personalized", "value_prop", "mutual_interest", "direct", "question_based"
+]
+
 # Slash commands for autocomplete
 SLASH_COMMANDS = [
     "/icp", "/add", "/variants", "/rm", "/run",
+    "/linkedin", "/linkedin add", "/linkedin variants", "/linkedin run",
     "/why", "/graph", "/rounds", "/parallel", "/history",
     "/runs", "/runs graph", "/runs report", "/runs show",
     "/config", "/setup", "/clear", "/new", "/help", "/quit",
