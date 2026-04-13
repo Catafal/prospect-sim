@@ -80,13 +80,15 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
     Interactive REPL session for prospect-sim.
 
     Session state:
-      icp_path     — currently loaded ICP file
-      project_id   — cached project_id for current ICP
-      variants     — list of variant dicts (built interactively)
-      rounds       — simulation rounds per variant (default 8)
-      parallel     — run variants in parallel (default False)
-      last_run_ids — simulation IDs from last /run (for /why)
-      last_report  — report dict from last /run
+      icp_path              — currently loaded ICP file
+      project_id            — cached project_id for current ICP
+      variants              — list of email variant dicts (built interactively)
+      linkedin_variants     — list of LinkedIn variant dicts
+      rounds                — simulation rounds per variant (default 8)
+      parallel              — run variants in parallel (default False)
+      last_run_ids          — simulation IDs from last /run or /linkedin (for /why)
+      last_report           — report dict from last email /run
+      last_linkedin_results — structured results dict from last /linkedin run (for /why)
     """
 
     def __init__(self, api_url: str = "") -> None:
@@ -104,6 +106,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self.parallel: bool = config.get("default_parallel") or False
         self.last_run_ids: list[dict] = []
         self.last_report: Optional[dict] = None
+        self.last_linkedin_results: Optional[dict] = None
 
         # Determine colour support
         no_color = bool(os.environ.get("NO_COLOR")) or not sys.stdout.isatty()
@@ -596,6 +599,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             return
 
         self.last_run_ids = run_ids
+        self.last_linkedin_results = results_data  # stored so /why can access it
         self._render_results_linkedin(results_data)
 
     def _render_results_linkedin(self, data: Optional[dict]) -> None:
@@ -832,9 +836,13 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self._print_hint("Run /why <number> to ask why a variant ranked where it did.")
 
     def _cmd_why(self, args: str) -> None:
-        """Stream a ReACT explanation for why a variant ranked as it did."""
+        """Explain why a variant ranked where it did. Works for both email and LinkedIn runs."""
+        # LinkedIn results take priority if the last run was /linkedin
+        if self.last_linkedin_results:
+            self._why_linkedin(args)
+            return
         if not self.last_report:
-            self._print_err("No results yet. Run /run first.")
+            self._print_err("No results yet. Run /run or /linkedin first.")
             return
 
         # Resolve variant by number or label
@@ -901,6 +909,88 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
                 )
             )
 
+    def _why_linkedin(self, args: str) -> None:
+        """
+        Render a structured explanation for a LinkedIn variant's ranking.
+        Uses last_linkedin_results (stored after /linkedin run) — no API call needed.
+        Mirrors _cmd_why's lookup pattern: resolve by rank number or label substring.
+        """
+        variants = (self.last_linkedin_results or {}).get("variants", [])
+        if not variants:
+            self._print_err("No LinkedIn ranking data. Run /linkedin first.")
+            return
+
+        # Resolve target variant — by number or label substring (same pattern as email /why)
+        target = None
+        rank_pos = None
+        args = args.strip()
+        if args.isdigit():
+            idx = int(args) - 1
+            if 0 <= idx < len(variants):
+                target = variants[idx]
+                rank_pos = idx + 1
+            else:
+                self._print_err(f"No variant #{args} in ranking (1–{len(variants)}).")
+                return
+        else:
+            for i, v in enumerate(variants):
+                if args.lower() in v.get("variant_label", "").lower():
+                    target = v
+                    rank_pos = i + 1
+                    break
+            if not target:
+                self._print_err(f"No variant matching '{args}'. Use /linkedin variants to check labels.")
+                return
+
+        label = target.get("variant_label", "?")
+        approach = target.get("approach_type", "unknown")
+        accept = target.get("accept_rate", 0)
+        view = target.get("view_rate", 0)
+        reply = target.get("reply_rate", 0)
+        composite = target.get("composite_score", 0)
+
+        # Main dropout point for this variant (most common dropout, if any)
+        dropouts = (self.last_linkedin_results or {}).get("dropouts", {})
+        variant_dropouts = dropouts.get(label, [])
+        main_dropout = variant_dropouts[0]["dropout_point"] if variant_dropouts else "none"
+
+        # Delta vs winner — shows how far behind the top variant this one ranked
+        winner = variants[0]
+        is_winner = rank_pos == 1
+        delta_line = ""
+        if not is_winner:
+            delta = round(winner.get("composite_score", 0) - composite, 3)
+            winner_label = winner.get("variant_label", "winner")
+            delta_line = (
+                f"\n\nComposite gap vs winner [bold]{winner_label}[/bold]: "
+                f"[red]−{delta:.3f}[/red]  "
+                f"(reply Δ {round(winner.get('reply_rate',0) - reply, 3):+.3f}  "
+                f"accept Δ {round(winner.get('accept_rate',0) - accept, 3):+.3f})"
+            )
+
+        # Build explanation body
+        rank_label = f"[bold {ORANGE}]#1 Winner[/bold {ORANGE}]" if is_winner else f"Ranked #{rank_pos}"
+        body = (
+            f"[italic]{rank_label} — approach: [bold]{approach}[/bold]\n\n"
+            f"  Accept   {accept * 100:.1f}%\n"
+            f"  View     {view * 100:.1f}%\n"
+            f"  Reply    {reply * 100:.1f}%\n"
+            f"  ─────────────────\n"
+            f"  Composite  {composite:.3f}  (reply×3 + accept×2 + view)\n"
+            f"  Dropout    {main_dropout}"
+            f"{delta_line}[/italic]"
+        )
+
+        self._print(f"\n[{DIM}]Why did '{label}' rank #{rank_pos}?[/{DIM}]\n")
+        self.console.print(
+            Panel(
+                body,
+                title=f"[{DIM}]LinkedIn Analysis: {label}[/{DIM}]",
+                border_style=ORANGE if is_winner else DIM,
+                subtitle=f"[{DIM}]dropout: {main_dropout}[/{DIM}]",
+            )
+        )
+
     def _cmd_rounds(self, args: str) -> None:
         """Set default rounds per variant."""
         if not args.strip().isdigit():
@@ -953,6 +1043,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self.linkedin_variants = []
         self.last_run_ids = []
         self.last_report = None
+        self.last_linkedin_results = None
         self._print_ok("Session reset. Load a new ICP with /icp <file>.")
 
     def _cmd_help(self) -> None:
