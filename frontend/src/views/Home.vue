@@ -142,14 +142,12 @@ const settingsOpen = ref(false)
 const selectedPlatform = ref(null)
 
 function handlePlatformSelect(id) {
-  // linkedin is disabled in PlatformSelectorPanel (pointer-events:none + disabled:true),
-  // but guard explicitly here as belt-and-suspenders.
-  if (id === 'linkedin') {
-    console.warn('[ProspectSim] LinkedIn platform not yet available')
-    return
-  }
   if (id === 'email') {
     router.push('/variant-test')
+    return
+  }
+  if (id === 'linkedin') {
+    router.push('/linkedin-test')
     return
   }
   // 'social' — show the simulation console

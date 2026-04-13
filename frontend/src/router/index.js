@@ -54,6 +54,12 @@ const routes = [
     path: '/variant-test',
     name: 'VariantTest',
     component: () => import('../views/VariantTestView.vue')
+  },
+  {
+    // B2B LinkedIn outreach copy variant testing — connection note + opening message A/B testing
+    path: '/linkedin-test',
+    name: 'LinkedInTest',
+    component: () => import('../views/LinkedInTestView.vue')
   }
 ]
 

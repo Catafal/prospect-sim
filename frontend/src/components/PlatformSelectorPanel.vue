@@ -48,7 +48,7 @@ const PLATFORMS = [
     icon: 'in',
     label: 'LinkedIn Outreach',
     sub: 'B2B prospecting',
-    disabled: true,
+    disabled: false,
   },
 ]
 

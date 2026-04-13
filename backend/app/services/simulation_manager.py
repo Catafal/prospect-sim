@@ -203,6 +203,7 @@ class SimulationManager:
         enable_reddit: bool = True,
         simulation_type: str = "social",
         email_variants: list = None,
+        linkedin_variants: list = None,
     ) -> SimulationState:
         """
         Create a new simulation.
@@ -211,13 +212,17 @@ class SimulationManager:
         subject_line/body/hook_type) — they are saved to email_variants.json in the
         sim dir so the runner script can seed the EmailInboxPlatform at start time.
 
+        For linkedin_outreach simulations, pass linkedin_variants (list of variant dicts
+        with connection_note/opening_message/approach_type) — saved to linkedin_variants.json.
+
         Args:
             project_id: Project ID
             graph_id: Graph ID
             enable_twitter: Whether to enable Twitter simulation
             enable_reddit: Whether to enable Reddit simulation
-            simulation_type: "social" | "email_inbox"
+            simulation_type: "social" | "email_inbox" | "linkedin_outreach"
             email_variants: Email copy variants (email_inbox only)
+            linkedin_variants: LinkedIn copy variants (linkedin_outreach only)
 
         Returns:
             SimulationState
@@ -244,6 +249,14 @@ class SimulationManager:
             with open(variants_path, "w", encoding="utf-8") as f:
                 json.dump(email_variants, f, ensure_ascii=False, indent=2)
             logger.info(f"Saved {len(email_variants)} email variants to {variants_path}")
+
+        # For LinkedIn outreach: persist variants so the runner can seed LinkedInOutreachPlatform.
+        elif simulation_type == "linkedin_outreach" and linkedin_variants:
+            sim_dir = self._get_simulation_dir(simulation_id)
+            variants_path = os.path.join(sim_dir, "linkedin_variants.json")
+            with open(variants_path, "w", encoding="utf-8") as f:
+                json.dump(linkedin_variants, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(linkedin_variants)} LinkedIn variants to {variants_path}")
 
         logger.info(
             f"Created simulation: {simulation_id}, project={project_id}, "
@@ -365,6 +378,10 @@ class SimulationManager:
                 # Email inbox saves profiles as JSON with B2B fields included
                 realtime_output_path = os.path.join(sim_dir, "email_inbox_profiles.json")
                 realtime_platform = "email_inbox"
+            elif state.simulation_type == "linkedin_outreach":
+                # LinkedIn outreach saves profiles as JSON — same format as email_inbox
+                realtime_output_path = os.path.join(sim_dir, "linkedin_outreach_profiles.json")
+                realtime_platform = "email_inbox"  # Reuse email_inbox JSON format from generator
             elif state.enable_reddit:
                 realtime_output_path = os.path.join(sim_dir, "reddit_profiles.json")
                 realtime_platform = "reddit"
@@ -400,6 +417,13 @@ class SimulationManager:
                     profiles=profiles,
                     file_path=os.path.join(sim_dir, "email_inbox_profiles.json"),
                     platform="email_inbox"
+                )
+            elif state.simulation_type == "linkedin_outreach":
+                # LinkedIn outreach profiles — same JSON format as email_inbox (B2B fields)
+                generator.save_profiles(
+                    profiles=profiles,
+                    file_path=os.path.join(sim_dir, "linkedin_outreach_profiles.json"),
+                    platform="email_inbox"  # Reuse email_inbox JSON format
                 )
             else:
                 if state.enable_reddit:

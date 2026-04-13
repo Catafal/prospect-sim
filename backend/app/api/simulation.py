@@ -1342,9 +1342,11 @@ def get_simulation_profiles_realtime(simulation_id: str):
                 "error": f"Simulation not found: {simulation_id}"
             }), 404
 
-        # Determine file path — email_inbox uses its own JSON profile format
+        # Determine file path — email_inbox and linkedin_outreach use JSON profile format
         if platform == "email_inbox":
             profiles_file = os.path.join(sim_dir, "email_inbox_profiles.json")
+        elif platform == "linkedin_outreach":
+            profiles_file = os.path.join(sim_dir, "linkedin_outreach_profiles.json")
         elif platform == "reddit":
             profiles_file = os.path.join(sim_dir, "reddit_profiles.json")
         else:
@@ -1939,10 +1941,10 @@ def start_simulation():
                     "error": "max_rounds must be a valid integer"
                 }), 400
 
-        if platform not in ['twitter', 'reddit', 'parallel', 'email_inbox']:
+        if platform not in ['twitter', 'reddit', 'parallel', 'email_inbox', 'linkedin_outreach']:
             return jsonify({
                 "success": False,
-                "error": f"Invalid platform type: {platform}, options: twitter/reddit/parallel/email_inbox"
+                "error": f"Invalid platform type: {platform}, options: twitter/reddit/parallel/email_inbox/linkedin_outreach"
             }), 400
 
         enable_cross_platform = data.get('enable_cross_platform', True)
@@ -3613,3 +3615,418 @@ def run_variant_test():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+# ============== LinkedIn Outreach Variant Test Endpoints ==============
+
+@simulation_bp.route('/run-linkedin-test', methods=['POST'])
+def run_linkedin_test():
+    """Run N LinkedIn outreach copy variants against synthetic B2B decision-maker personas.
+
+    Mirrors run_variant_test exactly — each variant gets its own simulation so
+    agents experience one copy at a time, keeping results clean and comparable.
+
+    Body (JSON):
+    {
+        "project_id": "proj_abc123",
+        "variants": [
+            {
+                "id": 1, "label": "Variant A",
+                "connection_note": "Hi Jane, saw your post on scaling ops teams — ...",
+                "opening_message": "Thanks for connecting! I wanted to share ...",
+                "approach_type": "personalized"
+            }
+        ],
+        "simulation_requirement": "Test LinkedIn outreach copy variants ...",
+        "parallel": false,
+        "num_rounds": 8
+    }
+
+    Response:
+    {
+        "success": true,
+        "run_mode": "sequential" | "parallel",
+        "variant_run_ids": [
+            {"variant_id": 1, "variant_label": "Variant A", "simulation_id": "sim_xyz"},
+            ...
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "JSON body required"}), 400
+
+        project_id = data.get("project_id")
+        variants = data.get("variants", [])
+        simulation_requirement = data.get("simulation_requirement", "")
+        parallel = bool(data.get("parallel", False))
+        num_rounds = int(data.get("num_rounds", 8))
+
+        if not project_id:
+            return jsonify({"success": False, "error": "project_id is required"}), 400
+        if not variants:
+            return jsonify({"success": False, "error": "At least one variant is required"}), 400
+        if len(variants) > 6:
+            return jsonify({"success": False, "error": "Maximum 6 variants per test run"}), 400
+
+        # Validate connection_note length — LinkedIn hard limit is 300 characters
+        for v in variants:
+            note = v.get("connection_note", "")
+            if len(note) > 300:
+                return jsonify({
+                    "success": False,
+                    "error": f"connection_note for '{v.get('label', 'variant')}' exceeds 300 chars (LinkedIn limit). Got {len(note)}."
+                }), 400
+
+        project = ProjectManager.get_project(project_id)
+        if not project:
+            return jsonify({"success": False, "error": f"Project not found: {project_id}"}), 404
+
+        if not project.graph_id:
+            return jsonify({
+                "success": False,
+                "error": "Project graph not built yet. Run graph build first."
+            }), 400
+
+        # Persist variant definitions and simulation type on the project
+        project.variants = variants
+        project.simulation_type = "linkedin_outreach"
+        if simulation_requirement:
+            project.simulation_requirement = simulation_requirement
+        ProjectManager.save_project(project)
+
+        run_mode = "parallel" if parallel else "sequential"
+        logger.info(
+            f"Starting LinkedIn variant test: project={project_id}, "
+            f"variants={len(variants)}, mode={run_mode}, rounds={num_rounds}"
+        )
+
+        variant_run_ids = []
+
+        import threading
+        from ..models.task import TaskManager, TaskStatus
+
+        # Capture Flask app context resources before spawning threads
+        app = current_app._get_current_object()
+        storage = app.extensions.get("neo4j_storage")
+        document_text = ProjectManager.get_extracted_text(project_id) or ""
+
+        if not simulation_requirement:
+            simulation_requirement = (
+                "Test LinkedIn outreach copy variants against B2B decision-maker personas "
+                "(Directors, VPs, Heads of department at mid-market companies)."
+            )
+            project.simulation_requirement = simulation_requirement
+
+        def _create_and_prepare_linkedin_variant(variant: dict) -> dict:
+            """Create a simulation, store the LinkedIn variant copy, and trigger prepare."""
+            vid = variant.get("id", 0)
+            label = variant.get("label", f"Variant {vid}")
+
+            sim_manager = SimulationManager()
+            state = sim_manager.create_simulation(
+                project_id=project_id,
+                graph_id=project.graph_id,
+                enable_twitter=False,
+                enable_reddit=False,
+                simulation_type="linkedin_outreach",
+                linkedin_variants=[variant],  # One variant per simulation for clean results
+            )
+            sim_id = state.simulation_id
+
+            task_manager = TaskManager()
+            task_id = task_manager.create_task(
+                task_type="simulation_prepare",
+                metadata={"simulation_id": sim_id, "project_id": project_id}
+            )
+
+            state.status = SimulationStatus.PREPARING
+            sim_manager._save_simulation_state(state)
+
+            def _do_prepare():
+                """Background thread: prepare this simulation's agent profiles + config."""
+                try:
+                    task_manager.update_task(
+                        task_id,
+                        status=TaskStatus.PROCESSING,
+                        progress=0,
+                        message="Starting LinkedIn agent profile generation..."
+                    )
+                    sim_manager.prepare_simulation(
+                        simulation_id=sim_id,
+                        simulation_requirement=simulation_requirement,
+                        document_text=document_text,
+                        storage=storage,
+                        parallel_profile_count=5,
+                    )
+                    task_manager.complete_task(task_id, result={"simulation_id": sim_id})
+                    logger.info(f"LinkedIn prepare complete for variant sim {sim_id}")
+                except Exception as e:
+                    logger.error(f"LinkedIn prepare failed for variant sim {sim_id}: {e}")
+                    task_manager.fail_task(task_id, str(e))
+                    fail_state = sim_manager.get_simulation(sim_id)
+                    if fail_state:
+                        fail_state.status = SimulationStatus.FAILED
+                        fail_state.error = str(e)
+                        sim_manager._save_simulation_state(fail_state)
+
+            thread = threading.Thread(target=_do_prepare, daemon=True)
+            thread.start()
+
+            return {
+                "variant_id": vid,
+                "variant_label": label,
+                "simulation_id": sim_id,
+                "prepare_task_id": task_id,
+                "status": "preparing",
+                "num_rounds": num_rounds,
+            }
+
+        if parallel:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(variants)) as executor:
+                futures = {executor.submit(_create_and_prepare_linkedin_variant, v): v for v in variants}
+                for future in concurrent.futures.as_completed(futures):
+                    variant_run_ids.append(future.result())
+        else:
+            for variant in variants:
+                variant_run_ids.append(_create_and_prepare_linkedin_variant(variant))
+
+        variant_run_ids.sort(key=lambda x: x["variant_id"])
+
+        # Persist variant→simulation mapping for the results endpoint
+        project.variant_simulation_ids = variant_run_ids
+        ProjectManager.save_project(project)
+
+        return jsonify({
+            "success": True,
+            "run_mode": run_mode,
+            "project_id": project_id,
+            "variant_run_ids": variant_run_ids,
+            "total_variants": len(variants),
+            "num_rounds": num_rounds,
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to start LinkedIn variant test: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/linkedin-events', methods=['GET'])
+def get_linkedin_events(simulation_id: str):
+    """Stream per-agent action events from the LinkedIn outreach simulation's SQLite DB.
+
+    Same pattern as inbox-events — supports cursor-based polling via ?since_id=N
+    so the frontend live feed only fetches new events each poll.
+
+    Returns:
+        {events: [{id, agent_id, variant_id, event_type, notes, created_at}], next_id}
+    """
+    conn = None
+    try:
+        since_id = int(request.args.get("since_id", 0))
+
+        mgr = SimulationManager()
+        state = mgr.get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": "Simulation not found"}), 404
+
+        sim_dir = os.path.join(Config.WONDERWALL_SIMULATION_DATA_DIR, simulation_id)
+        db_path = os.path.join(sim_dir, "linkedin_simulation.db")
+
+        if not os.path.exists(db_path):
+            # DB doesn't exist yet — simulation may still be in prepare phase
+            return jsonify({"success": True, "data": {"events": [], "next_id": since_id}})
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT e.id, e.agent_id, e.variant_id, e.event_type, e.notes, e.created_at, "
+            "v.variant_label, v.approach_type "
+            "FROM linkedin_event e "
+            "JOIN linkedin_variant v ON e.variant_id = v.variant_id "
+            "WHERE e.id > ? ORDER BY e.id ASC LIMIT 50",
+            (since_id,)
+        )
+        rows = cur.fetchall()
+
+        events = [
+            {
+                "id": row[0],
+                "agent_id": row[1],
+                "variant_id": row[2],
+                "event_type": row[3],
+                "notes": row[4],
+                "created_at": row[5],
+                "variant_label": row[6],
+                "approach_type": row[7],
+            }
+            for row in rows
+        ]
+
+        next_id = rows[-1][0] if rows else since_id
+        return jsonify({"success": True, "data": {"events": events, "next_id": next_id}})
+
+    except Exception as e:
+        logger.error(f"linkedin-events failed for {simulation_id}: {e}")
+        return jsonify({"success": True, "data": {"events": [], "next_id": since_id}})
+    finally:
+        if conn:
+            conn.close()
+
+
+@simulation_bp.route('/<simulation_id>/linkedin-variant-results', methods=['GET'])
+def get_linkedin_variant_results(simulation_id: str):
+    """Return structured variant performance data from linkedin_simulation.db as JSON.
+
+    Queries ALL variant simulation DBs via project.variant_simulation_ids so the
+    comparison spans the full set of variants run together.
+
+    Composite score: reply_rate × 3 + accept_rate × 2 + view_rate
+
+    Returns structured JSON suitable for direct rendering (no text parsing needed).
+    Returns data:null if no simulation data exists yet.
+    """
+    try:
+        mgr = SimulationManager()
+        state = mgr.get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": "Simulation not found"}), 404
+
+        project = ProjectManager.get_project(state.project_id)
+        if not project:
+            return jsonify({"success": False, "error": "Project not found"}), 404
+
+        # Build list of (variant_label, sim_id) pairs to query
+        sim_pairs = [
+            (entry.get("variant_label", f"Variant {entry.get('variant_id', i+1)}"),
+             entry.get("simulation_id", ""))
+            for i, entry in enumerate(getattr(project, "variant_simulation_ids", []))
+        ]
+        # Fallback to current simulation only
+        if not sim_pairs:
+            first_variant = project.variants[0] if project.variants else {}
+            sim_pairs = [(first_variant.get("label", "Variant A"), simulation_id)]
+
+        all_stats = []
+        all_dropouts = {}
+
+        for variant_label, sim_id in sim_pairs:
+            if not sim_id:
+                continue
+            db_path = os.path.join(Config.WONDERWALL_SIMULATION_DATA_DIR, sim_id, "linkedin_simulation.db")
+            if not os.path.exists(db_path):
+                continue
+            conn = None
+            try:
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+
+                # Per-variant engagement rates — accept, view, reply
+                cur.execute(
+                    "SELECT v.variant_id, v.variant_label, v.approach_type, "
+                    "COUNT(DISTINCT s.agent_id) as total_agents, "
+                    "SUM(COALESCE(s.accepted_connection, 0)) as total_accepts, "
+                    "SUM(COALESCE(s.viewed_profile, 0)) as total_views, "
+                    "SUM(COALESCE(s.replied, 0)) as total_replies "
+                    "FROM linkedin_variant v "
+                    "LEFT JOIN linkedin_outreach_state s ON v.variant_id = s.variant_id "
+                    "GROUP BY v.variant_id ORDER BY total_replies DESC"
+                )
+                for row in cur.fetchall():
+                    agents = row[3] or 1
+                    accepts, views, replies = row[4] or 0, row[5] or 0, row[6] or 0
+                    accept_rate = round(accepts / agents, 3)
+                    view_rate = round(views / agents, 3)
+                    reply_rate = round(replies / agents, 3)
+                    # Composite: reply (strongest signal) × 3 + accept × 2 + view
+                    composite = round(reply_rate * 3 + accept_rate * 2 + view_rate, 3)
+                    all_stats.append({
+                        "variant_label": row[1],
+                        "approach_type": row[2],
+                        "total_agents": row[3] or 0,
+                        "accept_rate": accept_rate,
+                        "view_rate": view_rate,
+                        "reply_rate": reply_rate,
+                        "composite_score": composite,
+                    })
+
+                # Dropout breakdown — where agents stopped engaging
+                cur.execute(
+                    "SELECT v.variant_label, s.dropout_point, COUNT(*) as count "
+                    "FROM linkedin_outreach_state s "
+                    "JOIN linkedin_variant v ON s.variant_id = v.variant_id "
+                    "WHERE s.dropout_point IS NOT NULL "
+                    "GROUP BY v.variant_id, s.dropout_point ORDER BY count DESC"
+                )
+                for row in cur.fetchall():
+                    lbl = row[0]
+                    if lbl not in all_dropouts:
+                        all_dropouts[lbl] = []
+                    all_dropouts[lbl].append({"dropout_point": row[1], "count": row[2]})
+
+            except Exception as e:
+                logger.warning(f"linkedin-variant-results: DB query failed for {sim_id}: {e}")
+            finally:
+                if conn:
+                    conn.close()
+
+        if not all_stats:
+            return jsonify({"success": True, "data": None})
+
+        # Sort by composite score — this is the ranking
+        all_stats.sort(key=lambda x: x["composite_score"], reverse=True)
+
+        winner = all_stats[0]
+        runner_up_delta = None
+        if len(all_stats) > 1:
+            runner = all_stats[1]
+            runner_up_delta = {
+                "label": runner["variant_label"],
+                "reply_rate_diff": round(winner["reply_rate"] - runner["reply_rate"], 3),
+            }
+
+        # Approach-type aggregation across all variants (replaces hook_type ranking from email)
+        approach_data = {}
+        for v in all_stats:
+            at = v["approach_type"]
+            if at not in approach_data:
+                approach_data[at] = {"reply_rates": [], "accept_rates": []}
+            approach_data[at]["reply_rates"].append(v["reply_rate"])
+            approach_data[at]["accept_rates"].append(v["accept_rate"])
+
+        approach_types = sorted([
+            {
+                "approach_type": at,
+                "avg_reply_rate": round(sum(d["reply_rates"]) / len(d["reply_rates"]), 3),
+                "avg_accept_rate": round(sum(d["accept_rates"]) / len(d["accept_rates"]), 3),
+                "count": len(d["reply_rates"]),
+            }
+            for at, d in approach_data.items()
+        ], key=lambda x: x["avg_reply_rate"], reverse=True)
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "variants": all_stats,
+                "winner": {
+                    "variant_label": winner["variant_label"],
+                    "approach_type": winner["approach_type"],
+                    "composite_score": winner["composite_score"],
+                    "reply_rate": winner["reply_rate"],
+                },
+                "runner_up_delta": runner_up_delta,
+                "dropouts": all_dropouts,
+                "approach_types": approach_types,
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"linkedin-variant-results failed for {simulation_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
