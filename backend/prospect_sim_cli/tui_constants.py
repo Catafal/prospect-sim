@@ -24,6 +24,7 @@ DROPOUT_COLORS = {
 # Slash commands for autocomplete
 SLASH_COMMANDS = [
     "/icp", "/add", "/variants", "/rm", "/run",
+    "/linkedin", "/linkedin add", "/linkedin variants", "/linkedin run",
     "/why", "/graph", "/rounds", "/parallel", "/history",
     "/runs", "/runs graph", "/runs report", "/runs show",
     "/config", "/setup", "/clear", "/new", "/help", "/quit",

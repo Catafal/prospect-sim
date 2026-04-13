@@ -335,6 +335,38 @@ class ApiClient:
             fix="Increase --timeout or check backend logs",
         )
 
+    def run_linkedin_test(
+        self,
+        project_id: str,
+        variants: list[dict],
+        simulation_requirement: str,
+        parallel: bool = False,
+        num_rounds: int = 8,
+    ) -> list[dict]:
+        """
+        Create one simulation per LinkedIn outreach variant.
+        Mirrors run_variant_test() but calls /run-linkedin-test.
+        Returns list of {variant_id, variant_label, simulation_id}.
+        """
+        result = self._post("/api/simulation/run-linkedin-test", json={
+            "project_id": project_id,
+            "variants": variants,
+            "simulation_requirement": simulation_requirement,
+            "parallel": parallel,
+            "num_rounds": num_rounds,
+        })
+        run_ids = result.get("variant_run_ids", [])
+        if not run_ids:
+            raise ApiError("no_simulations_created", "Backend created no simulation IDs")
+        return run_ids
+
+    def get_linkedin_variant_results(self, simulation_id: str) -> Optional[dict]:
+        """
+        Fetch structured LinkedIn variant performance data.
+        Returns data dict with variants/winner/dropouts/approach_types, or None if no data yet.
+        """
+        return self._get(f"/api/simulation/{simulation_id}/linkedin-variant-results")
+
     # ── Report ───────────────────────────────────────────────────────────
 
     def generate_report(self, simulation_id: str) -> str:

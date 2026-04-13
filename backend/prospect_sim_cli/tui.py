@@ -98,6 +98,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self.icp_path: Optional[Path] = None
         self.project_id: Optional[str] = None
         self.variants: list[dict] = []
+        self.linkedin_variants: list[dict] = []  # LinkedIn outreach variants (separate from email)
         self.rounds: int = config.get("default_rounds") or 8
         self.parallel: bool = config.get("default_parallel") or False
         self.last_run_ids: list[dict] = []
@@ -198,6 +199,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             "/variants": lambda _: self._cmd_variants(),
             "/rm": self._cmd_rm,
             "/run": lambda _: self._cmd_run(),
+            "/linkedin": self._cmd_linkedin,
             "/why": self._cmd_why,
             "/graph": self._cmd_graph,
             "/runs": self._cmd_runs,
@@ -424,6 +426,272 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self.last_run_ids = run_ids
         self.last_report = report
         self._render_results(report, run_ids)
+
+    # ── LinkedIn commands ─────────────────────────────────────────────────────
+
+    _LINKEDIN_APPROACH_TYPES = [
+        "personalized", "value_prop", "mutual_interest", "direct", "question_based"
+    ]
+
+    def _cmd_add_linkedin(self) -> None:
+        """
+        Interactive wizard: add a LinkedIn outreach variant to linkedin_variants.
+        Prompts for label, connection_note (300-char hard limit), opening_message, approach_type.
+        """
+        if not self.icp_path:
+            self._print_err("No ICP loaded. Run /icp <file> first.")
+            return
+
+        self._print(f"\n[bold {ORANGE}]Add LinkedIn variant[/bold {ORANGE}]\n")
+
+        # Label
+        label = self._session.prompt([("bold", " Label > "), ("", " ")]).strip()
+        if not label:
+            self._print_hint("Cancelled.")
+            return
+
+        # Connection note — enforce 300-char LinkedIn hard limit
+        connection_note = ""
+        while True:
+            connection_note = self._session.prompt(
+                [("bold", " Connection note (≤300 chars) > "), ("", " ")]
+            ).strip()
+            if not connection_note:
+                self._print_hint("Cancelled.")
+                return
+            if len(connection_note) > 300:
+                self._print_err(
+                    f"Too long: {len(connection_note)} chars (limit 300). "
+                    f"Remove {len(connection_note) - 300} character(s)."
+                )
+                continue
+            self._print_hint(f"{len(connection_note)}/300 chars")
+            break
+
+        # Opening message (sent after connection accepted)
+        opening_message = self._session.prompt(
+            [("bold", " Opening message > "), ("", " ")]
+        ).strip()
+        if not opening_message:
+            self._print_hint("Cancelled.")
+            return
+
+        # Approach type — show choices inline
+        choices_str = " | ".join(self._LINKEDIN_APPROACH_TYPES)
+        self._print_hint(f"Approach types: {choices_str}")
+        approach_type = ""
+        while True:
+            approach_type = self._session.prompt(
+                [("bold", " Approach type > "), ("", " ")]
+            ).strip().lower()
+            if not approach_type:
+                self._print_hint("Cancelled.")
+                return
+            if approach_type not in self._LINKEDIN_APPROACH_TYPES:
+                self._print_err(f"Invalid approach type. Choose from: {choices_str}")
+                continue
+            break
+
+        variant = {
+            "id": len(self.linkedin_variants) + 1,
+            "label": label,
+            "connection_note": connection_note,
+            "opening_message": opening_message,
+            "approach_type": approach_type,
+        }
+        self.linkedin_variants.append(variant)
+        self._print_ok(
+            f"Added LinkedIn variant #{len(self.linkedin_variants)}: "
+            f"[{approach_type}] {label}"
+        )
+
+    def _cmd_linkedin(self, args: str = "") -> None:
+        """
+        LinkedIn outreach command. Sub-commands:
+          /linkedin           — start variant builder (or run if variants exist)
+          /linkedin add       — add a LinkedIn outreach variant
+          /linkedin variants  — show current LinkedIn variants table
+          /linkedin run       — run simulation with current linkedin_variants
+          /linkedin rm <n>    — remove variant by number
+        """
+        sub = args.strip().lower()
+
+        if sub == "add":
+            self._cmd_add_linkedin()
+            return
+        if sub == "variants":
+            self._render_linkedin_variants_table()
+            return
+        if sub.startswith("rm"):
+            self._cmd_rm_linkedin(sub[2:].strip())
+            return
+        if sub and sub != "run":
+            self._print_err(f"Unknown /linkedin sub-command: '{sub}'. Try /linkedin add, /linkedin variants, /linkedin run.")
+            return
+
+        # No sub-command (or "run") — start builder if no variants, else run simulation
+        if not self.linkedin_variants and sub != "run":
+            self._print_hint("No LinkedIn variants yet. Starting variant builder…")
+            self._cmd_add_linkedin()
+            if not self.linkedin_variants:
+                return  # User cancelled the builder
+
+        if not self.icp_path or not self.project_id:
+            self._print_err("No ICP loaded. Run /icp <file> first.")
+            return
+        if not self.linkedin_variants:
+            self._print_err("No LinkedIn variants. Use /linkedin add to create at least one.")
+            return
+        if len(self.linkedin_variants) > 6:
+            self._print_err("Maximum 6 variants per run. Remove some first.")
+            return
+        if not self.client.health_check():
+            self._print_err("Backend offline. Start it first.")
+            return
+
+        n = len(self.linkedin_variants)
+        self._print(
+            f"\n[bold {ORANGE}]Starting LinkedIn run[/bold {ORANGE}]  "
+            f"[{DIM}]{n} variant(s) · {self.rounds} rounds each · "
+            f"{'parallel' if self.parallel else 'sequential'}[/{DIM}]\n"
+        )
+
+        requirement = (
+            "Rank LinkedIn outreach variants by reply and connection acceptance. "
+            "Identify which approach_type drives the highest accept and reply rates."
+        )
+
+        try:
+            run_ids = self.client.run_linkedin_test(
+                self.project_id, self.linkedin_variants, requirement, self.parallel, self.rounds,
+            )
+        except ApiError as exc:
+            self._print_err(f"{exc.code}: {exc.message}")
+            return
+
+        # Prepare (linkedin_outreach type) and start all simulations
+        for entry in run_ids:
+            sim_id = entry["simulation_id"]
+            label = entry.get("variant_label", sim_id)
+            try:
+                with self.console.status(
+                    f"[{DIM}]Preparing '{label}'…[/{DIM}]", spinner="dots"
+                ):
+                    task_id = self.client.prepare_simulation(sim_id, simulation_type="linkedin_outreach")
+                    self.client.poll_task(task_id, timeout=300)
+                self.client.start_simulation(sim_id)
+            except ApiError as exc:
+                self._print_err(f"Failed to prepare '{label}': {exc.message}")
+                return
+
+        # Live dashboard — reused unchanged (platform-agnostic)
+        self._run_simulation_dashboard(run_ids)
+
+        # Fetch LinkedIn variant results (no ReACT agent — structured data direct from DB)
+        self._print_info("Fetching LinkedIn variant results…")
+        try:
+            results_data = self.client.get_linkedin_variant_results(run_ids[0]["simulation_id"])
+        except ApiError as exc:
+            self._print_err(f"Could not fetch results: {exc.message}")
+            return
+
+        self.last_run_ids = run_ids
+        self._render_results_linkedin(results_data)
+
+    def _render_results_linkedin(self, data: Optional[dict]) -> None:
+        """
+        Render LinkedIn variant ranking table.
+        Shows Accept% / View% / Reply% / Composite — not email's Opens/Replies/Dropout.
+        """
+        if not data:
+            self._print_hint("No results yet. Simulation may still be starting.")
+            return
+
+        variants = data.get("variants", [])
+        if not variants:
+            self._print_hint("No variant data in results.")
+            return
+
+        table = Table(
+            title="LinkedIn Variant Ranking",
+            show_header=True,
+            header_style=f"bold {ORANGE}",
+            border_style=DIM,
+            show_lines=True,
+            padding=(0, 1),
+        )
+        table.add_column("#", style=DIM, width=4)
+        table.add_column("Variant", min_width=20)
+        table.add_column("Approach", min_width=14)
+        table.add_column("Accept%", justify="right", min_width=8)
+        table.add_column("View%", justify="right", min_width=6)
+        table.add_column("Reply%", justify="right", min_width=7)
+        table.add_column("Composite", justify="right", min_width=9)
+
+        for i, v in enumerate(variants):
+            rank = f"[bold {ORANGE}]👑 1[/bold {ORANGE}]" if i == 0 else f"  {i + 1}"
+            accept = f"{v.get('accept_rate', 0) * 100:.1f}%"
+            view = f"{v.get('view_rate', 0) * 100:.1f}%"
+            reply = f"{v.get('reply_rate', 0) * 100:.1f}%"
+            composite = f"{v.get('composite_score', 0):.3f}"
+            table.add_row(
+                rank,
+                v.get("variant_label", "—"),
+                v.get("approach_type", "—"),
+                accept,
+                view,
+                reply,
+                composite,
+            )
+
+        self.console.print()
+        self.console.print(table)
+
+        winner = data.get("winner", {})
+        if winner:
+            self._print_ok(
+                f"Winner: [bold]{winner.get('variant_label')}[/bold] "
+                f"({winner.get('approach_type')}) — "
+                f"composite {winner.get('composite_score', 0):.3f}"
+            )
+        self.console.print()
+
+    def _render_linkedin_variants_table(self) -> None:
+        """Show current LinkedIn variants in a table (mirrors _cmd_variants for email)."""
+        if not self.linkedin_variants:
+            self._print_hint("No LinkedIn variants. Use /linkedin add to create one.")
+            return
+        table = Table(
+            title="LinkedIn Variants",
+            show_header=True,
+            header_style=f"bold {ORANGE}",
+            border_style=DIM,
+            show_lines=True,
+            padding=(0, 1),
+        )
+        table.add_column("#", style=DIM, width=3)
+        table.add_column("Label", min_width=16)
+        table.add_column("Approach", min_width=14)
+        table.add_column("Connection Note", min_width=30)
+        for i, v in enumerate(self.linkedin_variants, start=1):
+            note = v.get("connection_note", "")
+            note_preview = note[:50] + "…" if len(note) > 50 else note
+            table.add_row(str(i), v.get("label", "—"), v.get("approach_type", "—"), note_preview)
+        self.console.print()
+        self.console.print(table)
+        self.console.print()
+
+    def _cmd_rm_linkedin(self, args: str) -> None:
+        """Remove a LinkedIn variant by number (/linkedin rm <n>)."""
+        if not args.strip().isdigit():
+            self._print_err("Usage: /linkedin rm <number>")
+            return
+        n = int(args.strip())
+        if n < 1 or n > len(self.linkedin_variants):
+            self._print_err(f"Variant #{n} not found. Use /linkedin variants to see the list.")
+            return
+        removed = self.linkedin_variants.pop(n - 1)
+        self._print_ok(f"Removed LinkedIn variant #{n}: {removed.get('label', '?')}")
 
     def _run_simulation_dashboard(self, run_ids: list[dict]) -> None:
         """
@@ -678,10 +946,11 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self._print_ok(f"Cleared {n} variant(s).")
 
     def _cmd_new(self) -> None:
-        """Reset session — clear ICP, variants, last results."""
+        """Reset session — clear ICP, variants (email + linkedin), last results."""
         self.icp_path = None
         self.project_id = None
         self.variants = []
+        self.linkedin_variants = []
         self.last_run_ids = []
         self.last_report = None
         self._print_ok("Session reset. Load a new ICP with /icp <file>.")
@@ -704,7 +973,12 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             ("/add",                 "Interactive wizard: add an email variant to the session."),
             ("/variants",            "Show all current variants in a table."),
             ("/rm <n>",              "Remove variant by number."),
-            ("/run",                 "Simulate all variants. Shows live dashboard + inline results."),
+            ("/run",                 "Simulate all email variants. Shows live dashboard + inline results."),
+            ("/linkedin",            "LinkedIn outreach: start variant builder, or run if variants exist."),
+            ("/linkedin add",        "Add a LinkedIn variant (connection_note, opening_message, approach_type)."),
+            ("/linkedin variants",   "Show current LinkedIn variants."),
+            ("/linkedin run",        "Run LinkedIn simulation with current linkedin_variants."),
+            ("/linkedin rm <n>",     "Remove LinkedIn variant by number."),
             ("/why <n|label>",       "Explain why a variant ranked where it did."),
             ("/graph",               "Show ICP knowledge graph structure (entity types, counts)."),
             ("/graph open",          "Same, and open the D3 visualization in your browser."),
