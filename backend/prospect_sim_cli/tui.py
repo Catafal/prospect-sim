@@ -89,6 +89,9 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
       last_run_ids          — simulation IDs from last /run or /linkedin (for /why)
       last_report           — report dict from last email /run
       last_linkedin_results — structured results dict from last /linkedin run (for /why)
+      last_platform         — "email" | "linkedin" | None — explicit platform of last run,
+                              used by /why to route correctly instead of checking which
+                              result dict is populated (avoids ambiguity when both exist)
     """
 
     def __init__(self, api_url: str = "") -> None:
@@ -107,6 +110,10 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self.last_run_ids: list[dict] = []
         self.last_report: Optional[dict] = None
         self.last_linkedin_results: Optional[dict] = None
+        # Explicit platform tracker — avoids implicit branching on which result dict is set.
+        # Set to "email" before /run API call, "linkedin" before /linkedin API call.
+        # Cleared to None on /new.
+        self.last_platform: Optional[str] = None
 
         # Determine colour support
         no_color = bool(os.environ.get("NO_COLOR")) or not sys.stdout.isatty()
@@ -389,6 +396,11 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             "(subject_line / opening / body / cta) for each variant."
         )
 
+        # Mark platform before API call so /why routes correctly even if the run fails
+        # partway through. Clear stale LinkedIn data so the two result sets never coexist.
+        self.last_platform = "email"
+        self.last_linkedin_results = None
+
         try:
             run_ids = self.client.run_variant_test(
                 self.project_id, self.variants, requirement, self.parallel, self.rounds,
@@ -563,6 +575,11 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
             "Rank LinkedIn outreach variants by reply and connection acceptance. "
             "Identify which approach_type drives the highest accept and reply rates."
         )
+
+        # Mark platform before API call — mirrors email path. Clear stale email report
+        # so /why can never accidentally show email analysis after a LinkedIn run.
+        self.last_platform = "linkedin"
+        self.last_report = None
 
         try:
             run_ids = self.client.run_linkedin_test(
@@ -837,11 +854,16 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
 
     def _cmd_why(self, args: str) -> None:
         """Explain why a variant ranked where it did. Works for both email and LinkedIn runs."""
-        # LinkedIn results take priority if the last run was /linkedin
-        if self.last_linkedin_results:
+        # Route on last_platform (explicit) — avoids ambiguity when both result dicts happen
+        # to be populated from alternating runs within the same session.
+        if self.last_platform is None:
+            self._print_err("No results yet. Run /run or /linkedin first.")
+            return
+        if self.last_platform == "linkedin":
             self._why_linkedin(args)
             return
         if not self.last_report:
+            # last_platform == "email" but report is missing — shouldn't happen, guard anyway
             self._print_err("No results yet. Run /run or /linkedin first.")
             return
 
@@ -1044,6 +1066,7 @@ class ProspectSimTUI(TuiConfigMixin, TuiGraphMixin):
         self.last_run_ids = []
         self.last_report = None
         self.last_linkedin_results = None
+        self.last_platform = None  # cleared so /why shows "No results yet" correctly
         self._print_ok("Session reset. Load a new ICP with /icp <file>.")
 
     def _cmd_help(self) -> None:
