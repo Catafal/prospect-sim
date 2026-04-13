@@ -9,8 +9,8 @@
      S  I  M
 </pre>
 
-**B2B Cold Email Variant Tester**
-Test your email copy against AI personas before hitting send.
+**B2B Outreach Variant Tester — Email & LinkedIn**
+Test your cold outreach copy against AI personas before hitting send.
 
 </div>
 
@@ -18,13 +18,20 @@ Test your email copy against AI personas before hitting send.
 
 ## What It Does
 
-prospect-sim runs your B2B cold email variants against synthetic decision-maker personas derived from your ICP. It tells you which variant gets opened, which gets a reply, and — crucially — **where each one loses the prospect**.
+prospect-sim runs your B2B outreach variants against synthetic decision-maker personas derived from your ICP. It tells you which variant performs best and — crucially — **where each one loses the prospect**.
+
+Two outreach platforms supported:
+
+| Platform | What it tests | Key metrics |
+|---|---|---|
+| **Email** | Subject line, opening, body, CTA | Open rate, reply rate, dropout point |
+| **LinkedIn** | Connection note, opening message, approach type | Accept rate, view rate, reply rate, composite score |
 
 Three phases:
 
 1. **Graph Build** — Uploads your ICP file (MD/TXT/PDF) and builds a Neo4j knowledge graph of prospect personas. Cached after first run (~5-10 min once, then ~20 sec).
-2. **Simulation** — Each email variant runs against multiple rounds of AI personas. Agents decide whether to open, reply, or drop out at each funnel stage.
-3. **Ranking** — A ReACT agent analyzes all simulations and produces a ranked result: winner, scores per variant, and dropout point (subject line / opening / body / CTA).
+2. **Simulation** — Each variant runs against multiple rounds of AI personas. Agents decide whether to accept/open/reply or drop out at each funnel stage.
+3. **Ranking** — Results ranked by platform-specific composite score. Email uses a ReACT report agent; LinkedIn ranking is computed directly from structured simulation data (faster, no LLM call).
 
 Two interfaces — pick one:
 
@@ -346,6 +353,7 @@ prospect-sim run --icp <file> --variants <file> [OPTIONS]
 Options:
   --icp <file>               ICP profile file (MD/TXT/PDF)              [required]
   --variants <file>          Variants JSON file (max 6 variants)        [required]
+  --platform <email|linkedin>  Simulation platform                      [default: email]
   --rounds <int>             Simulation rounds per variant              [default: 8]
   --parallel/--sequential    Run variants in parallel or sequentially   [default: sequential]
   --dry-run                  Show execution plan without running
@@ -354,7 +362,7 @@ Options:
   --api-url <url>            Backend URL                                [env: PROSPECT_SIM_API_URL]
 ```
 
-**Output (default):**
+**Email output (default):**
 ```
 Variant Ranking
 ┌─────┬─────────────────────┬────────────┬───────┬─────────┬──────────────┐
@@ -366,6 +374,19 @@ Variant Ranking
 
 🏆 Winner: Problem-led
 ```
+
+**LinkedIn output (`--platform linkedin`):**
+```
+LinkedIn Variant Ranking
+┌─────┬──────────────┬──────────────────┬─────────┬───────┬────────┬───────────┐
+│ #   │ Variant      │ Approach         │ Accept% │ View% │ Reply% │ Composite │
+├─────┼──────────────┼──────────────────┼─────────┼───────┼────────┼───────────┤
+│ 👑1 │ Personalized │ personalized     │  62.5%  │ 41.2% │ 30.8%  │   1.843   │
+│   2 │ Value-prop   │ value_prop       │  48.1%  │ 35.6% │ 21.4%  │   1.491   │
+└─────┴──────────────┴──────────────────┴─────────┴───────┴────────┴───────────┘
+```
+
+> **Composite score** = `reply×3 + accept×2 + view` — weights replies highest since they signal the strongest intent.
 
 **Output (`--quiet`, pipeable JSON):**
 ```json
@@ -471,18 +492,37 @@ Drops into an interactive REPL. First launch runs a 30-second setup wizard.
 
 ### Slash Commands
 
-#### Simulation
+#### Simulation — Email
 
 | Command | Description |
 |---|---|
 | `/icp <file>` | Load an ICP file (tab-autocomplete). Builds graph if not cached — reuses in ~20s if cached. |
 | `/add` | Interactive wizard to add an email variant to the session. |
-| `/variants` | Show all current variants in a table. |
-| `/rm <n>` | Remove variant by number. |
-| `/run` | Simulate all variants. Shows live braille-spinner dashboard per variant. Prints ranking inline on completion. |
-| `/why <n\|label>` | Explain why a variant ranked where it did. |
+| `/variants` | Show all current email variants in a table. |
+| `/rm <n>` | Remove email variant by number. |
+| `/run` | Simulate all email variants. Shows live braille-spinner dashboard per variant. Prints ranking inline on completion. |
+| `/why <n\|label>` | Explain why a variant ranked where it did. Works for both email and LinkedIn runs. |
 | `/graph` | Show the ICP knowledge graph structure — entity types, node/edge counts, breakdown bar chart. |
 | `/graph open` | Same, plus opens the D3 force-directed visualization in your browser. |
+
+#### Simulation — LinkedIn
+
+| Command | Description |
+|---|---|
+| `/linkedin add` | Interactive wizard to add a LinkedIn outreach variant (connection note + opening message + approach type). |
+| `/linkedin variants` | Show all current LinkedIn variants in a table. |
+| `/linkedin run` | Simulate all LinkedIn variants. Ranks by composite score (reply×3 + accept×2 + view). No ReACT agent — results computed directly from structured simulation data. |
+| `/linkedin rm <n>` | Remove LinkedIn variant by number. |
+
+**LinkedIn approach types** (select during `/linkedin add`):
+
+| Type | Description |
+|---|---|
+| `personalized` | Tailored to the prospect's specific role, company, or recent activity |
+| `value_prop` | Leads with a concrete outcome or result your product delivers |
+| `mutual_interest` | References shared connections, groups, or industry context |
+| `direct` | Straight ask — minimal preamble, clear intent |
+| `question_based` | Opens with a relevant question to spark curiosity |
 
 #### Session
 
@@ -492,7 +532,7 @@ Drops into an interactive REPL. First launch runs a 30-second setup wizard.
 | `/parallel` | Toggle parallel / sequential simulation mode. |
 | `/history` | Show all cached ICP projects. |
 | `/clear` | Clear all current variants. |
-| `/new` | Reset session — clear ICP, variants, and results. |
+| `/new` | Reset session — clear ICP, all variants (email + LinkedIn), and results. |
 
 #### Configuration
 
@@ -542,6 +582,8 @@ The cache also validates the project still exists on the backend. If it was dele
 
 ## Variants File Format
 
+### Email variants (`--platform email`, default)
+
 ```json
 [
   {
@@ -556,7 +598,31 @@ The cache also validates the project still exists on the backend. If it was dele
 ]
 ```
 
-Max 6 variants per run. All fields except `id` and `label` are passed to the simulation as copy content — include whatever email elements you want tested.
+### LinkedIn variants (`--platform linkedin`)
+
+```json
+[
+  {
+    "id": 1,                          // unique integer (required)
+    "label": "Personalized",          // display name (required)
+    "approach_type": "personalized",  // one of: personalized, value_prop, mutual_interest, direct, question_based (required)
+    "connection_note": "...",         // connection request note — max 300 chars (required)
+    "opening_message": "..."          // first message after connection accepted (required)
+  }
+]
+```
+
+**`approach_type` values:**
+
+| Value | Description |
+|---|---|
+| `personalized` | Tailored to prospect's role, company, or recent activity |
+| `value_prop` | Leads with a concrete outcome your product delivers |
+| `mutual_interest` | References shared connections, groups, or industry context |
+| `direct` | Straight ask — minimal preamble, clear intent |
+| `question_based` | Opens with a relevant question to spark curiosity |
+
+Max 6 variants per run for both platforms.
 
 ---
 
