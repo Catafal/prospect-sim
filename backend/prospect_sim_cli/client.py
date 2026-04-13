@@ -209,17 +209,19 @@ class ApiClient:
         icp_path: Path,
         project_name: str,
         simulation_requirement: str,
+        simulation_type: str = "email_inbox",
     ) -> dict:
         """
         Step 1: Upload ICP file and generate ontology.
         Returns dict with project_id and ontology.
+        simulation_type controls which persona generator is used during prepare.
         """
         with open(icp_path, "rb") as f:
             files = [("files", (icp_path.name, f, "application/octet-stream"))]
             form_data = {
                 "simulation_requirement": simulation_requirement,
                 "project_name": project_name,
-                "simulation_type": "email_inbox",
+                "simulation_type": simulation_type,
             }
             return self._post("/api/graph/ontology/generate", files=files, data=form_data)
 
@@ -285,14 +287,15 @@ class ApiClient:
             raise ApiError("no_simulations_created", "Backend created no simulation IDs")
         return run_ids
 
-    def prepare_simulation(self, simulation_id: str) -> str:
+    def prepare_simulation(self, simulation_id: str, simulation_type: str = "email_inbox") -> str:
         """
         Prepare a simulation (generates agent profiles).
         Returns task_id for polling.
+        simulation_type must match what was set at ontology generation time.
         """
         result = self._post("/api/simulation/prepare", json={
             "simulation_id": simulation_id,
-            "simulation_type": "email_inbox",
+            "simulation_type": simulation_type,
         })
         task_id = result.get("task_id")
         if not task_id:

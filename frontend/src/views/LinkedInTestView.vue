@@ -118,6 +118,36 @@
       </div>
     </div>
 
+    <!-- Agent Personas — visible after prepare completes (same as email variant test) -->
+    <div v-if="personas.length > 0" class="personas-section">
+      <h3 class="section-title">Test Audience — {{ personas.length }} B2B personas</h3>
+      <div class="personas-grid">
+        <div v-for="p in personas" :key="p.user_id || p.user_name" class="persona-card">
+          <div class="persona-header">
+            <div class="persona-name">{{ p.name || p.user_name }}</div>
+            <div class="persona-title">{{ p.title || p.profession || 'Professional' }}</div>
+          </div>
+          <div class="persona-tags">
+            <span v-if="p.seniority" class="persona-tag">{{ p.seniority }}</span>
+            <span v-if="p.company_size" class="persona-tag">{{ p.company_size }}</span>
+            <span v-if="p.industry" class="persona-tag tag-industry">{{ p.industry }}</span>
+          </div>
+          <div class="persona-receptiveness">
+            <!-- Connection receptiveness bar — how likely they are to accept cold requests -->
+            <span class="receptiveness-label">Receptiveness</span>
+            <div class="receptiveness-bar">
+              <div class="receptiveness-fill"
+                :style="{ width: ((p.connection_receptiveness || 0.25) * 100) + '%' }"
+                :class="receptivenessClass(p.connection_receptiveness)">
+              </div>
+            </div>
+            <span class="receptiveness-pct">{{ Math.round((p.connection_receptiveness || 0.25) * 100) }}%</span>
+          </div>
+          <div class="persona-activity">{{ p.activity_level || 'weekly' }} on LinkedIn</div>
+        </div>
+      </div>
+    </div>
+
     <!-- Results Panel -->
     <div v-if="results && !loading" class="results-panel">
       <div class="results-header">
@@ -279,6 +309,9 @@ export default {
     let feedNextId = 0
     let feedSimId = ''
 
+    // Agent personas (loaded after prepare completes — same as email variant test)
+    const personas = ref([])
+
     // Structured variant metrics (loaded after any sim completes — no LLM required)
     const variantResults = ref(null)
     const variantResultsLoading = ref(false)
@@ -321,6 +354,25 @@ export default {
 
     function wordCount(text) {
       return text.trim().split(/\s+/).filter(Boolean).length
+    }
+
+    /** Fetch generated LinkedIn personas for the test audience display. */
+    async function fetchPersonas(simId) {
+      try {
+        const resp = await fetch(`/api/simulation/${simId}/profiles/realtime?platform=linkedin_outreach`)
+        const data = await resp.json()
+        if (data.success && data.data?.profiles?.length) {
+          personas.value = data.data.profiles
+        }
+      } catch (e) { console.warn('Could not load personas:', e) }
+    }
+
+    /** Returns a CSS class for the receptiveness fill bar color. */
+    function receptivenessClass(val) {
+      if (!val) return 'rcpt-low'
+      if (val >= 0.4) return 'rcpt-high'
+      if (val >= 0.25) return 'rcpt-mid'
+      return 'rcpt-low'
     }
 
     function addVariant() {
@@ -486,6 +538,8 @@ export default {
           (d) => d?.data?.status === 'failed',
           3000,
         )
+        // Load personas as soon as profiles are ready (first sim only — all sims share the same graph)
+        if (!personas.value.length) fetchPersonas(simulation_id)
       }
 
       // Start simulation
@@ -553,6 +607,7 @@ export default {
 
     function resetForm() {
       results.value = null; error.value = ''
+      personas.value = []
       variantResults.value = null; variantResultsError.value = ''; variantResultsLoading.value = false
       report.value = null; reportError.value = ''; reportLoading.value = false
       feedEvents.value = []; feedNextId = 0
@@ -613,6 +668,7 @@ export default {
 
     return {
       router, projects, loading, loadingStatus, error, results,
+      personas, fetchPersonas, receptivenessClass,
       feedEvents, variantResults, variantResultsLoading, variantResultsError,
       form, canRun, firstSimId, allCompleted,
       wordCount, addVariant, removeVariant, getApproachType, shortId,
@@ -791,4 +847,25 @@ export default {
 
 .results-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 .restart-btn { background: #111118; border: 1px solid #1e1e2e; color: #a0a0b4; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+
+/* ── Persona cards — mirrors VariantTestView layout but with LinkedIn-specific fields ── */
+.personas-section { background: #0d0d14; border: 1px solid #1e1e2e; border-radius: 8px; padding: 24px; margin: 0 0 24px; }
+.personas-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
+.persona-card { background: #111118; border: 1px solid #1e1e2e; border-radius: 6px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.persona-header { display: flex; flex-direction: column; gap: 2px; }
+.persona-name { font-size: 13px; font-weight: 600; color: #e4e4e9; }
+.persona-title { font-size: 11px; color: #6b6b82; }
+.persona-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.persona-tag { font-size: 10px; padding: 2px 7px; border-radius: 3px; background: #1a1a2e; color: #60a5fa; border: 1px solid #1d4ed8; }
+.tag-industry { color: #93c5fd; border-color: #2563eb; }
+/* Receptiveness bar — compact visual showing connection acceptance probability */
+.persona-receptiveness { display: flex; align-items: center; gap: 6px; }
+.receptiveness-label { font-size: 10px; color: #4b4b60; flex-shrink: 0; }
+.receptiveness-bar { flex: 1; height: 4px; background: #1e1e2e; border-radius: 2px; overflow: hidden; }
+.receptiveness-fill { height: 100%; border-radius: 2px; transition: width 0.3s ease; }
+.rcpt-high { background: #34d399; }
+.rcpt-mid  { background: #60a5fa; }
+.rcpt-low  { background: #f87171; }
+.receptiveness-pct { font-size: 10px; color: #4b4b60; flex-shrink: 0; }
+.persona-activity { font-size: 10px; color: #4b4b60; }
 </style>

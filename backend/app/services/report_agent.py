@@ -638,17 +638,21 @@ and did on Twitter and Reddit. Use this BEFORE graph search tools.
 - Track how discourse evolved across rounds"""
 
 TOOL_DESC_VARIANT_RESULTS = """\
-[Variant Results — Email Inbox Simulation Data]
-Queries the email inbox SQLite database(s) and returns structured stats for all
-email copy variants tested in this simulation run.
+[Variant Results — Copy Testing Simulation Data]
+Queries the simulation SQLite database(s) and returns structured stats for all
+copy variants tested in this run. Works for both email_inbox and linkedin_outreach.
 
-ONLY available for email_inbox simulations. Returns:
+EMAIL INBOX — returns:
 1. Per-variant metrics: open_rate, read_rate, reply_rate, forward_rate, avg_intent_score
 2. Composite score ranking: reply_rate×3 + forward_rate×2 + open_rate×1
-3. Dropout breakdown: which copy element (subject_line, opening, body, cta, timing)
-   caused agents to abandon each variant
-4. Hook-type performance: which hook_type (problem/timeline/numbers/social_proof/curiosity)
-   had the best engagement across variants
+3. Dropout breakdown: subject_line / opening / body / cta / timing
+4. Hook-type performance summary
+
+LINKEDIN OUTREACH — returns:
+1. Per-variant metrics: accept_rate, view_rate, reply_rate
+2. Composite score ranking: reply_rate×3 + accept_rate×2 + view_rate×1
+3. Dropout breakdown: connection_note / pending / no_context
+4. Approach-type performance summary
 
 [Parameters]
 None required.
@@ -656,11 +660,11 @@ None required.
 [Return Content]
 - Ranked variants table with rates and composite scores
 - Per-variant dropout point counts
-- Hook-type aggregate summary
+- Hook/approach-type aggregate summary
 
 [Use Cases]
 - Determine which variant won and by how much
-- Identify where agents dropped out (subject_line vs. body vs. cta)
+- Identify where prospects dropped off in the funnel
 - Support data-driven winner recommendation"""
 
 # ── Outline Planning Prompt ──
@@ -789,6 +793,97 @@ Use your analysis tools to query the simulation database for:
 - Lead with the finding, support with data
 - Include specific numbers: "8/20 agents opened Variant B vs 3/20 for Variant A"
 - Name the copy element responsible: "the subject line mentioning '15 open roles' vs generic pain framing"
+- Be direct — this is an internal analysis report, not marketing copy
+- For the Recommendation section: give one specific next copy iteration to test
+
+[Output Format]
+Prose analysis with a summary table at the end of the Variant Performance section.
+The Recommendation section must include:
+1. The winner (variant label + expected reply rate)
+2. The specific change that drove it
+3. The next hypothesis to test (one A/B element)
+
+{section_history}"""
+
+# ── LinkedIn Outreach Report Prompts ──────────────────────────────────────────
+
+LINKEDIN_PLAN_SYSTEM_PROMPT = """\
+You are an expert B2B sales strategist analyzing the results of a LinkedIn outreach simulation.
+You have a "god's eye view" of how synthetic B2B decision-maker personas responded to cold
+connection requests and opening messages. Your job is to produce an actionable variant ranking report.
+
+[Core Objective]
+Rank the LinkedIn outreach variants by expected reply probability. Explain WHY each variant
+performed differently — specifically which element (connection note, opening message, approach type)
+drove the delta. Give a clear recommendation: which variant to use, and what specific change
+would improve acceptance and reply rates further.
+
+[Report Structure — Fixed, 4 sections]
+Always produce exactly 4 sections in this order:
+1. "Variant Performance Ranking" — table + scores for each variant (accept_rate, view_rate, reply_rate, composite)
+2. "Funnel Dropout Analysis" — where prospects dropped off per variant (connection_note / pending / no_context)
+3. "Persona Segmentation" — which variant worked for which persona type (seniority, company_size, industry)
+4. "Recommendation & Next Copy Iteration" — the winner, the delta, and the next hypothesis to test
+
+[Analytical Standards]
+- Every claim must be grounded in agent action data (accepts, views, replies, dropouts)
+- Name specific copy elements: connection note brevity, personalization signals, value prop clarity
+- Distinguish between persona types — a direct approach may work for VPs but not C-suite
+- Be concrete: "Variant B got 2x more replies than Variant A because the opening message referenced
+  a specific company trigger rather than a generic value proposition"
+
+Output the report outline in JSON:
+{
+    "title": "LinkedIn Outreach Variant Test — [brief description]",
+    "summary": "One sentence: which variant won, by how much, and the key driver",
+    "sections": [
+        {"title": "...", "description": "..."}
+    ]
+}
+
+Note: Always produce exactly 4 sections as defined above."""
+
+LINKEDIN_PLAN_USER_PROMPT_TEMPLATE = """\
+[Simulation Setup]
+Variants tested: {simulation_requirement}
+
+[Simulation Scale]
+- Active personas: {total_entities}
+- Total LinkedIn events recorded: {total_nodes}
+
+[Agent Action Summary]
+{related_facts_json}
+
+Analyze which outreach variant performed best and why. Focus on:
+1. Accept rates vs reply rates per variant (which approach type got more accepts? which got more replies?)
+2. Dropout point distribution — where did prospects disengage? (connection_note vs pending vs no_context)
+3. Persona segmentation — which seniority levels / industries / company sizes responded differently?
+4. The specific copy element that drove the winning variant's advantage
+
+Output the 4-section outline with the summary being the single most actionable finding."""
+
+LINKEDIN_SECTION_SYSTEM_PROMPT_TEMPLATE = """\
+You are a B2B sales strategist writing a section of a LinkedIn outreach variant test report.
+
+Report title: {report_title}
+Key finding: {report_summary}
+Variants tested: {simulation_requirement}
+
+[Your Section]
+Section title: {section_title}
+Section purpose: {section_description}
+
+[Data Access]
+Use your analysis tools to query the simulation database for:
+- Agent action counts per variant (accepts, views, replies, ignored)
+- Dropout point distribution per variant (connection_note / pending / no_context)
+- B2B persona traits of agents who accepted vs ignored (seniority, company_size, industry, connection_receptiveness)
+
+[Writing Standards]
+- Lead with the finding, support with data
+- Include specific numbers: "8/20 personas accepted Variant B vs 3/20 for Variant A"
+- Name the copy element responsible: "connection note mentioning mutual connection signal vs generic opener"
+- Distinguish persona segments: "C-suite personas accepted at 10% vs directors at 30%"
 - Be direct — this is an internal analysis report, not marketing copy
 - For the Recommendation section: give one specific next copy iteration to test
 
@@ -1658,12 +1753,17 @@ class ReportAgent:
         return candidates[0]
 
     def _execute_variant_results(self) -> str:
-        """Query email_simulation.db for all variants and return structured stats.
+        """Query simulation DB(s) for all variants and return structured stats.
 
-        Uses project.variant_simulation_ids to find each variant's simulation directory,
-        opens each email_simulation.db directly via sqlite3, and aggregates results.
+        Dispatches to the correct implementation based on simulation_type:
+        - email_inbox: reads email_simulation.db (email_variant / agent_inbox_state tables)
+        - linkedin_outreach: reads linkedin_simulation.db (linkedin_variant / linkedin_outreach_state)
+
+        Uses project.variant_simulation_ids to find each variant's simulation directory.
         Handles missing DBs gracefully — useful when simulation hasn't run yet.
         """
+        if self.simulation_type == "linkedin_outreach":
+            return self._execute_linkedin_variant_results()
         # Import here to avoid circular imports at module level
         from ..models.project import ProjectManager
         from .simulation_manager import SimulationManager
@@ -1830,6 +1930,166 @@ class ReportAgent:
 
         return "\n".join(lines)
 
+    def _execute_linkedin_variant_results(self) -> str:
+        """Query linkedin_simulation.db for all LinkedIn outreach variants.
+
+        Mirror of _execute_variant_results but for LinkedIn schema:
+        - linkedin_variant table (variant_id, variant_label, approach_type)
+        - linkedin_outreach_state (agent_id, variant_id, accepted_connection, viewed_profile, replied, dropout_point)
+        Composite score: reply_rate×3 + accept_rate×2 + view_rate×1
+        """
+        from ..models.project import ProjectManager
+        from .simulation_manager import SimulationManager
+
+        lines = ["=== LinkedIn Outreach Variant Results ==="]
+
+        try:
+            mgr = SimulationManager()
+            state = mgr.get_simulation(self.simulation_id)
+            if not state:
+                return f"variant_results: simulation not found ({self.simulation_id})"
+            project = ProjectManager.get_project(state.project_id)
+            if not project:
+                return f"variant_results: project not found ({state.project_id})"
+        except Exception as e:
+            return f"variant_results: failed to load project — {e}"
+
+        sim_pairs = [
+            (entry.get("variant_label", f"Variant {entry.get('variant_id', i+1)}"),
+             entry.get("simulation_id", ""))
+            for i, entry in enumerate(project.variant_simulation_ids)
+        ]
+        if not sim_pairs:
+            label = project.variants[0].get("label", "Variant A") if project.variants else "Variant A"
+            sim_pairs = [(label, self.simulation_id)]
+            lines.append("[NOTE] variant_simulation_ids not set — querying current simulation only.")
+
+        all_stats: List[Dict] = []
+        all_dropouts: Dict[str, List[Dict]] = {}
+        missing_dbs: List[str] = []
+
+        for variant_label, sim_id in sim_pairs:
+            if not sim_id:
+                continue
+            sim_dir = self._get_variant_sim_dir(sim_id)
+            db_path = os.path.join(sim_dir, "linkedin_simulation.db")
+
+            if not os.path.exists(db_path):
+                missing_dbs.append(f"{variant_label} ({sim_id})")
+                continue
+
+            try:
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+
+                # Per-variant acceptance / view / reply rates
+                cur.execute(
+                    "SELECT v.variant_id, v.variant_label, v.approach_type, "
+                    "COUNT(DISTINCT s.agent_id) as total_agents, "
+                    "SUM(COALESCE(s.accepted_connection, 0)) as accepts, "
+                    "SUM(COALESCE(s.viewed_profile, 0)) as views, "
+                    "SUM(COALESCE(s.replied, 0)) as replies "
+                    "FROM linkedin_variant v "
+                    "LEFT JOIN linkedin_outreach_state s ON v.variant_id = s.variant_id "
+                    "GROUP BY v.variant_id "
+                    "ORDER BY replies DESC"
+                )
+                for row in cur.fetchall():
+                    agents = row[3] or 1
+                    accepts, views, replies = row[4] or 0, row[5] or 0, row[6] or 0
+                    accept_rate = round(accepts / agents, 3)
+                    view_rate = round(views / agents, 3)
+                    reply_rate = round(replies / agents, 3)
+                    composite = round(reply_rate * 3 + accept_rate * 2 + view_rate, 3)
+                    all_stats.append({
+                        "variant_id": row[0],
+                        "variant_label": row[1],
+                        "approach_type": row[2],
+                        "total_agents": row[3] or 0,
+                        "accept_rate": accept_rate,
+                        "view_rate": view_rate,
+                        "reply_rate": reply_rate,
+                        "composite_score": composite,
+                    })
+
+                # Dropout breakdown (where in the funnel prospects disengaged)
+                cur.execute(
+                    "SELECT v.variant_label, s.dropout_point, COUNT(*) as count "
+                    "FROM linkedin_outreach_state s "
+                    "JOIN linkedin_variant v ON s.variant_id = v.variant_id "
+                    "WHERE s.dropout_point IS NOT NULL "
+                    "GROUP BY v.variant_id, s.dropout_point "
+                    "ORDER BY v.variant_id, count DESC"
+                )
+                for row in cur.fetchall():
+                    lbl = row[0]
+                    if lbl not in all_dropouts:
+                        all_dropouts[lbl] = []
+                    all_dropouts[lbl].append({"dropout_point": row[1], "count": row[2]})
+
+                conn.close()
+            except Exception as e:
+                lines.append(f"[WARN] Failed to query DB for {variant_label}: {e}")
+
+        if missing_dbs:
+            lines.append(f"[NOTE] No LinkedIn DB found for: {', '.join(missing_dbs)} — simulation may not have run yet.")
+
+        if not all_stats:
+            return "\n".join(lines) + "\n[ERROR] No variant data found. Run the simulation first."
+
+        all_stats.sort(key=lambda x: x["composite_score"], reverse=True)
+
+        # Section 1: Ranked variants table
+        lines.append("\n--- VARIANT RANKINGS (reply_rate×3 + accept_rate×2 + view_rate×1) ---")
+        lines.append(f"{'Rank':<5} {'Variant':<20} {'Approach':<22} {'Accept%':<9} {'View%':<8} {'Reply%':<8} {'Score':<7}")
+        lines.append("-" * 78)
+        for i, v in enumerate(all_stats):
+            lines.append(
+                f"{i+1:<5} {v['variant_label']:<20} {v['approach_type']:<22} "
+                f"{v['accept_rate']*100:>5.1f}%   {v['view_rate']*100:>5.1f}%  "
+                f"{v['reply_rate']*100:>5.1f}%  {v['composite_score']:>5.3f}"
+            )
+
+        winner = all_stats[0]
+        lines.append(f"\n*** WINNER: {winner['variant_label']} (approach: {winner['approach_type']}, composite: {winner['composite_score']}) ***")
+        if len(all_stats) > 1:
+            runner = all_stats[1]
+            delta_reply = round((winner['reply_rate'] - runner['reply_rate']) * 100, 1)
+            lines.append(f"    Reply rate delta vs runner-up ({runner['variant_label']}): +{delta_reply}%")
+
+        # Section 2: Dropout breakdown
+        lines.append("\n--- DROPOUT BREAKDOWN (where prospects disengaged) ---")
+        if all_dropouts:
+            for label, points in all_dropouts.items():
+                lines.append(f"\n{label}:")
+                for dp in points:
+                    lines.append(f"  {dp['dropout_point']:20s}: {dp['count']} prospects")
+        else:
+            lines.append("  No dropout data recorded.")
+
+        # Section 3: Approach-type performance summary
+        lines.append("\n--- APPROACH-TYPE PERFORMANCE ---")
+        approach_agg: Dict[str, Dict] = {}
+        for v in all_stats:
+            at = v["approach_type"]
+            if at not in approach_agg:
+                approach_agg[at] = {"reply_rates": [], "accept_rates": [], "count": 0}
+            approach_agg[at]["reply_rates"].append(v["reply_rate"])
+            approach_agg[at]["accept_rates"].append(v["accept_rate"])
+            approach_agg[at]["count"] += 1
+
+        approach_summary = []
+        for at, data in approach_agg.items():
+            avg_reply = sum(data["reply_rates"]) / len(data["reply_rates"])
+            avg_accept = sum(data["accept_rates"]) / len(data["accept_rates"])
+            approach_summary.append((at, avg_reply, avg_accept, data["count"]))
+        approach_summary.sort(key=lambda x: x[1], reverse=True)
+
+        for at, avg_reply, avg_accept, count in approach_summary:
+            lines.append(f"  {at:<22}: avg_reply={avg_reply*100:.1f}%  avg_accept={avg_accept*100:.1f}%  (n={count})")
+
+        return "\n".join(lines)
+
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
         Parse tool calls from LLM response
@@ -1933,6 +2193,14 @@ class ReportAgent:
         if self.simulation_type == "email_inbox":
             system_prompt = EMAIL_PLAN_SYSTEM_PROMPT
             user_prompt = EMAIL_PLAN_USER_PROMPT_TEMPLATE.format(
+                simulation_requirement=self.simulation_requirement,
+                total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
+                total_entities=context.get('total_entities', 0),
+                related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
+            )
+        elif self.simulation_type == "linkedin_outreach":
+            system_prompt = LINKEDIN_PLAN_SYSTEM_PROMPT
+            user_prompt = LINKEDIN_PLAN_USER_PROMPT_TEMPLATE.format(
                 simulation_requirement=self.simulation_requirement,
                 total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
                 total_entities=context.get('total_entities', 0),
@@ -2042,6 +2310,16 @@ class ReportAgent:
         # Select section prompt based on simulation type
         if self.simulation_type == "email_inbox":
             system_prompt = EMAIL_SECTION_SYSTEM_PROMPT_TEMPLATE.format(
+                report_title=outline.title,
+                report_summary=outline.summary,
+                simulation_requirement=self.simulation_requirement,
+                section_title=section.title,
+                section_description=section.description,
+                section_history=previous_content,
+            )
+            user_prompt = f"Write the '{section.title}' section now."
+        elif self.simulation_type == "linkedin_outreach":
+            system_prompt = LINKEDIN_SECTION_SYSTEM_PROMPT_TEMPLATE.format(
                 report_title=outline.title,
                 report_summary=outline.summary,
                 simulation_requirement=self.simulation_requirement,
@@ -2442,10 +2720,11 @@ Write in the same analytical style as the report. Use **bold** for emphasis. Do 
             )
             ReportManager.save_report(report)
             
-            # For email_inbox simulations: pre-fetch structured variant stats before planning.
+            # For copy-testing simulations: pre-fetch structured variant stats before planning.
             # This populates report.variant_analysis so it's available in the API response
             # and gives the LLM structured context when writing the report outline.
-            if self.simulation_type == "email_inbox":
+            # Covers both email_inbox and linkedin_outreach (both use variant_results tool).
+            if self.simulation_type in ("email_inbox", "linkedin_outreach"):
                 try:
                     variant_data = self._execute_variant_results()
                     report.variant_analysis = variant_data
